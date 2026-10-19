@@ -16,70 +16,19 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-	"unsafe"
 )
 
-// ---- layout: C macros vs Go constants -------------------------------------------
+// ---- layout: types_gen.go must match c/procctl.h ----------------------------------
 
-func TestLayoutMatchesC(t *testing.T) {
-	bin := buildC(t, "c/tests/layout_dump.c")
-	out, err := exec.Command(bin).Output()
+// The wire structs exist only in c/procctl.h; types_gen.go is generated from
+// it with `go tool cgo -godefs`. Fail if someone changed one without the other.
+func TestGeneratedTypesUpToDate(t *testing.T) {
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler")
+	}
+	out, err := exec.Command("scripts/gen-types.sh", "--check").CombinedOutput()
 	if err != nil {
-		t.Fatal(err)
-	}
-	var c map[string]int
-	if err := json.Unmarshal(out, &c); err != nil {
-		t.Fatalf("%v: %s", err, out)
-	}
-	var wh wireHeader
-	var cb ctrlBlock
-	var g Grant
-	var sh stateHeader
-	var re ResourceEntry
-	off := func(o uintptr) int { return int(o) }
-	want := map[string]int{
-		"HEADER_SIZE": HeaderSize, "CTRL_SIZE": CtrlSize, "ENTRY_SIZE": EntrySize,
-		"STATE_HDR_SIZE": StateHdrSize, "MAX_SLOTS": MaxSlots, "MAX_STATE_SIZE": MaxStateSize,
-		"SPEC_MAJOR": SpecMajor, "SPEC_MINOR": SpecMinor,
-		"H_SIG": off(unsafe.Offsetof(wh.Signature)), "H_MAJOR": off(unsafe.Offsetof(wh.SpecMajor)),
-		"H_MINOR": off(unsafe.Offsetof(wh.SpecMinor)), "H_HSIZE": off(unsafe.Offsetof(wh.HeaderSize)),
-		"H_TOTAL": off(unsafe.Offsetof(wh.TotalSize)), "H_PAGE": off(unsafe.Offsetof(wh.PageSize)),
-		"H_CONSUMER": off(unsafe.Offsetof(wh.Consumer)), "H_SCHEMA": off(unsafe.Offsetof(wh.SchemaVersion)),
-		"H_CREATOR": off(unsafe.Offsetof(wh.CreatorPID)), "H_AREA_OFF": off(unsafe.Offsetof(wh.AgentAreaOff)),
-		"H_AREA_SIZE": off(unsafe.Offsetof(wh.AgentAreaSize)), "H_STATE_ADDR": off(unsafe.Offsetof(wh.StateAddr)),
-		"H_STATE_SIZE": off(unsafe.Offsetof(wh.StateSize)), "H_SLOTS": off(unsafe.Offsetof(wh.ResourceSlots)),
-		"H_CREATED": off(unsafe.Offsetof(wh.CreatedAtNS)), "H_INSTANCE": off(unsafe.Offsetof(wh.InstanceID)),
-		"H_CRC": off(unsafe.Offsetof(wh.HeaderCRC)),
-		"C_SEQ": off(unsafe.Offsetof(cb.Seq)), "C_LEN": off(unsafe.Offsetof(cb.PayloadLen)),
-		"C_FLAGS": off(unsafe.Offsetof(cb.Flags)), "C_WRITER": off(unsafe.Offsetof(cb.WriterID)),
-		"C_HB": off(unsafe.Offsetof(cb.HeartbeatNS)), "C_LEASE": off(unsafe.Offsetof(cb.LeaseNS)),
-		"C_CRC":   off(unsafe.Offsetof(cb.PayloadCRC32)),
-		"S_MAGIC": off(unsafe.Offsetof(sh.Magic)), "S_SEQ": off(unsafe.Offsetof(sh.Seq)),
-		"S_INSTANCE": off(unsafe.Offsetof(sh.InstanceID)), "S_PID": off(unsafe.Offsetof(sh.WriterPID)),
-		"S_LEN": off(unsafe.Offsetof(sh.StateLen)), "S_APPLIED": off(unsafe.Offsetof(sh.AppliedGen)),
-		"S_APPLIED_W": off(unsafe.Offsetof(sh.AppliedWriterID)), "S_SEEN": off(unsafe.Offsetof(sh.GrantsSeenGen)),
-		"S_CRC": off(unsafe.Offsetof(sh.CRC32)),
-		"E_ID":  off(unsafe.Offsetof(g.ID)), "E_GRANT": off(unsafe.Offsetof(g.GrantID)),
-		"E_DUR": off(unsafe.Offsetof(g.Duration)), "E_KIND": off(unsafe.Offsetof(g.Kind)),
-		"E_ACTIVITY": off(unsafe.Offsetof(re.LastActivityNS)), "E_STATE": off(unsafe.Offsetof(re.State)),
-		"E_FLAGS": off(unsafe.Offsetof(re.Flags)), "E_ERROR": off(unsafe.Offsetof(re.Error)),
-		"RES_IDLE": ResIdle, "RES_ACQUIRING": ResAcquiring, "RES_HOLDING": ResHolding,
-		"RES_RELEASED": ResReleased, "RES_FAILED": ResFailed, "RES_F_WANT": ResFlagWant,
-	}
-	// The grant and resource entries share id/grant_id/kind positions.
-	if unsafe.Offsetof(g.ID) != unsafe.Offsetof(re.ID) || unsafe.Offsetof(g.GrantID) != unsafe.Offsetof(re.GrantID) ||
-		unsafe.Offsetof(g.Kind) != unsafe.Offsetof(re.Kind) {
-		t.Error("grant and resource entries disagree on shared fields")
-	}
-	for k, v := range want {
-		if got, ok := c[k]; !ok || got != v {
-			t.Errorf("%s: C=%d (present=%v) Go=%d", k, got, ok, v)
-		}
-	}
-	for k := range c {
-		if _, ok := want[k]; !ok {
-			t.Errorf("C exports %s, which Go does not check", k)
-		}
+		t.Fatalf("%v\n%s", err, out)
 	}
 }
 

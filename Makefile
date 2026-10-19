@@ -3,8 +3,9 @@ CFLAGS ?= -O1 -g -Wall -Wextra -Werror
 BIN    := bin
 SAN    := -fsanitize=address,undefined -fno-sanitize-recover=all
 
+# Regenerate types_gen.go from the wire structs in c/procctl.h (go tool cgo -godefs).
 generate:
-	go run ./cmd/procctl-gen -schema schemas/testproto.procctl.json -c-out c/gen -go-out internal/testproto -go-package testproto -vectors testdata/vectors
+	scripts/gen-types.sh
 
 .PHONY: generate all test test-c test-c-compile test-go bench fuzz-go fuzz-c model-long kernel-report demo clean
 
@@ -33,9 +34,6 @@ test-c-compile:
 test-c: | $(BIN)
 	$(CC) -std=c11 $(CFLAGS) $(SAN) -o $(BIN)/unit_test c/tests/unit_test.c -lpthread
 	$(BIN)/unit_test
-	$(CC) -std=c11 $(CFLAGS) -o $(BIN)/vectors_test c/tests/vectors_test.c
-	$(BIN)/vectors_test testdata/vectors
-	g++ -std=c++17 -Wall -Wextra -Werror -x c++ -fsyntax-only c/gen/testproto_schema.h
 
 test-go:
 	go vet ./...

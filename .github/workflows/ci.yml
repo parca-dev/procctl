@@ -26,14 +26,16 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
       - name: Install compilers
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang
       - name: Kernel and feature report
         run: make -s kernel-report | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: types_gen.go matches c/procctl.h (go tool cgo -godefs)
+        run: scripts/gen-types.sh --check
       - name: procctl.h compile matrix (gcc/clang, C/C++, system/bundled sdt.h)
         run: make -s test-c-compile
       - name: C unit tests (ASan/UBSan)
@@ -58,8 +60,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
       - name: Install clang

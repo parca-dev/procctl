@@ -31,8 +31,15 @@ type area struct {
 }
 
 // cb overlays the control block on the start of the agent area. The area is
-// page-aligned, which satisfies the atomics' alignment.
+// page-aligned and the fields are naturally aligned, as the atomics need.
 func (a *area) cb() *ctrlBlock { return (*ctrlBlock)(unsafe.Pointer(&a.body[0])) }
+
+// The control block is shared with the process: every access is atomic.
+func ld64(p *uint64) uint64                 { return atomic.LoadUint64(p) }
+func ld32(p *uint32) uint32                 { return atomic.LoadUint32(p) }
+func st64(p *uint64, v uint64)              { atomic.StoreUint64(p, v) }
+func st32(p *uint32, v uint32)              { atomic.StoreUint32(p, v) }
+func cas64(p *uint64, old, new uint64) bool { return atomic.CompareAndSwapUint64(p, old, new) }
 
 func (a *area) word(off int) *atomic.Uint64 {
 	return (*atomic.Uint64)(unsafe.Pointer(&a.body[CtrlSize+off]))
@@ -49,26 +56,28 @@ func (a *area) write(payload []byte, grants []Grant, flags uint32) (uint64, []Gr
 		return 0, nil, ErrTooLarge
 	}
 	cb := a.cb()
-	s := cb.Seq.Load()
+	s := ld64(&cb.Seq)
 	t := s + 1
 	if s&1 == 1 {
 		t = s + 2 // adopt a cycle left by a dead writer
 	}
-	if !cb.Seq.CompareAndSwap(s, t) {
+	if !cas64(&cb.Seq, s, t) {
 		return 0, nil, ErrPreempted
 	}
 	gen := t + 1
 
 	// Assemble the agent payload, padded to whole words.
-	out := make([]Grant, a.slots)
+	out := make([]Grant, len(grants))
+	table := make([]grantEntry, a.slots) // empty slots encode as zeros
 	for i, g := range grants {
 		if g.GrantID == 0 {
 			g.GrantID = gen
 		}
 		out[i] = g
+		table[i] = g.wire()
 	}
 	var buf bytes.Buffer
-	encode(&buf, out) // empty slots encode as zeros
+	encode(&buf, table)
 	buf.Write(payload)
 	n := buf.Len()
 	buf.Write(make([]byte, (8-n%8)%8))
@@ -80,14 +89,14 @@ func (a *area) write(payload []byte, grants []Grant, flags uint32) (uint64, []Gr
 	for off := 0; off < len(b); off += 8 {
 		a.word(off).Store(le.Uint64(b[off:]))
 	}
-	cb.PayloadLen.Store(uint32(len(payload)))
-	cb.Flags.Store(flags)
-	cb.PayloadCRC32.Store(crc)
-	if !cb.Seq.CompareAndSwap(t, gen) {
+	st32(&cb.Payload_len, uint32(len(payload)))
+	st32(&cb.Flags, flags)
+	st32(&cb.Payload_crc32c, crc)
+	if !cas64(&cb.Seq, t, gen) {
 		return 0, nil, ErrPreempted
 	}
 	a.wake()
-	return gen, out[:len(grants)], nil
+	return gen, out, nil
 }
 
 // FUTEX_WAKE without FUTEX_PRIVATE_FLAG: the word is in a shared mapping.
@@ -107,15 +116,15 @@ func (a *area) readPayload() (gen uint64, payload []byte, grants []Grant, err er
 	gt := a.slots * EntrySize
 	cb := a.cb()
 	for tries := 0; tries < 8; tries++ {
-		s1 := cb.Seq.Load()
+		s1 := ld64(&cb.Seq)
 		if s1&1 == 1 {
 			continue
 		}
 		if s1 == 0 {
 			return 0, nil, nil, nil
 		}
-		n := int(cb.PayloadLen.Load())
-		want := cb.PayloadCRC32.Load()
+		n := int(ld32(&cb.Payload_len))
+		want := ld32(&cb.Payload_crc32c)
 		if CtrlSize+gt+n > len(a.body) {
 			continue
 		}
@@ -124,16 +133,16 @@ func (a *area) readPayload() (gen uint64, payload []byte, grants []Grant, err er
 		for off := 0; off < len(buf); off += 8 {
 			le.PutUint64(buf[off:], a.word(off).Load())
 		}
-		if cb.Seq.Load() != s1 || crc32c(buf[:total]) != want {
+		if ld64(&cb.Seq) != s1 || crc32c(buf[:total]) != want {
 			continue
 		}
-		table := make([]Grant, a.slots)
+		table := make([]grantEntry, a.slots)
 		if err := decode(buf[:gt], &table); err != nil {
 			return 0, nil, nil, err
 		}
-		for _, g := range table {
-			if g.GrantID != 0 {
-				grants = append(grants, g)
+		for _, e := range table {
+			if e.Grant_id != 0 {
+				grants = append(grants, grantFromWire(e))
 			}
 		}
 		return s1, buf[gt:total], grants, nil

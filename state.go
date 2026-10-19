@@ -11,16 +11,6 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// Resource states (SPEC §6.1).
-const (
-	ResIdle      = 0
-	ResAcquiring = 1
-	ResHolding   = 2
-	ResReleased  = 3
-	ResFailed    = 4
-	ResFlagWant  = 1 << 0
-)
-
 // MayHold reports whether the entry claims the resource may be in use.
 func (e ResourceEntry) MayHold() bool {
 	return e.State == ResAcquiring || e.State == ResHolding
@@ -111,11 +101,11 @@ func parseState(buf []byte, h *Header, innermostNSPid int) (State, error) {
 	if sh.Seq&1 == 1 || sh.Seq == 0 {
 		return st, ErrStateBusy
 	}
-	if string(sh.Magic[:]) != stateMagic || sh.InstanceID != h.InstanceID {
+	if string(sh.Magic[:]) != stateMagic || sh.Instance_id != h.InstanceID {
 		return st, ErrStateInvalid
 	}
 	tableEnd := StateHdrSize + int(h.ResourceSlots)*resEntrySize
-	used := tableEnd + int(sh.StateLen)
+	used := tableEnd + int(sh.State_len)
 	if used > len(buf) {
 		return st, ErrStateInvalid
 	}
@@ -123,24 +113,24 @@ func parseState(buf []byte, h *Header, innermostNSPid int) (State, error) {
 	chk := append([]byte(nil), buf[:used]...)
 	clear(chk[stateSeqOff : stateSeqOff+8])
 	clear(chk[stateCRCOff : stateCRCOff+4])
-	if crc32c(chk) != sh.CRC32 {
+	if crc32c(chk) != sh.Crc32c {
 		return st, ErrStateBusy // torn across the syscalls, or corrupt
 	}
 	st = State{
-		Seq: sh.Seq, WriterPID: sh.WriterPID, AppliedGen: sh.AppliedGen,
-		AppliedWriterID: sh.AppliedWriterID, GrantsSeenGen: sh.GrantsSeenGen,
-		Stale: int(sh.WriterPID) != innermostNSPid,
+		Seq: sh.Seq, WriterPID: sh.Writer_pid, AppliedGen: sh.Applied_gen,
+		AppliedWriterID: sh.Applied_writer_id, GrantsSeenGen: sh.Grants_seen_gen,
+		Stale: int(sh.Writer_pid) != innermostNSPid,
 	}
 	if st.Stale {
 		return st, nil
 	}
-	table := make([]ResourceEntry, h.ResourceSlots)
+	table := make([]resEntry, h.ResourceSlots)
 	if err := decode(buf[StateHdrSize:tableEnd], &table); err != nil {
 		return State{}, ErrStateInvalid
 	}
 	for _, r := range table {
-		if r.Kind != 0 || r.ID != ([16]byte{}) {
-			st.Resources = append(st.Resources, r)
+		if r.Kind != 0 || r.Resource_id != ([16]byte{}) {
+			st.Resources = append(st.Resources, resourceFromWire(r))
 		}
 	}
 	st.Consumer = append([]byte(nil), buf[tableEnd:used]...)

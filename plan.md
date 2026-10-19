@@ -17,7 +17,7 @@ This plan covers building procctl and proving it on its own. The parcagpu and pa
 
 ## 0. Scope notes and decisions
 
-Several lines in the prompt were commented out by accident. All of them are in scope: lease, handshake e2e, header-pid assertion, Go↔C stress, cgo offset checks.
+Several lines in the prompt were commented out by accident. All of them are in scope: lease, handshake e2e, header-pid assertion, Go↔C stress, cgo offset checks. The last became moot once the Go wire types were generated from the C header (§5.5).
 
 **Decisions:**
 - **The client is read-only.** It maps the region `PROT_READ` and reports through a state block in its own memory, read remotely (SPEC §6, §7.3). This replaces the earlier process→agent shared area. It is driven by the "fly on the wall" goal: nothing in the user's process writes memory that anyone else maps.
@@ -325,11 +325,11 @@ exclusive/               # arbiter (SPEC §9.2) + policies
 hello/                   # USDT watcher (parca-dev/usdt + cilium/ebpf)
 internal/perfsideband/   # mmap2 sideband reader (adapted from ebpf-profiler internal/perfutil)
 internal/shm/            # atomic word access over mmapped bytes
-internal/conformance/    # golden vectors, interop, stress harness
-c/procctl.h              # THE vendorable file
-c/tests/                 # unit tests, libFuzzer harness, poll/state microbenchmarks
-testdata/vectors/        # golden region and state-block images
-cmd/procctl-gen/         # schema → C header + Go codec
+c/procctl.h              # THE vendorable file, and the only definition of the wire structs
+types_def.go             # cgo -godefs input (//go:build ignore)
+types_gen.go             # Go wire types generated from c/procctl.h (committed)
+scripts/gen-types.sh     # regenerate / --check (CI)
+c/tests/                 # unit tests, interop and stress clients, libFuzzer harness, poll microbenchmarks
 cmd/procctl-testagent/
 testclient/              # C test client + Dockerfile
 examples/echo/           # config-only example consumer
@@ -353,10 +353,14 @@ Apache-2.0. The bundled `<sys/sdt.h>` is SystemTap's (CC0). `internal/perfsideba
 - `scripts/vendor-procctl.sh <tag> <dest>` writes `procctl.VERSION`.
 - Consumers add a CI hash check.
 
-### 5.5 Consumer schemas in Go: code generation plus offset tests
-- **The schema file:** `<consumer>.procctl.yaml` declares the consumer payload, the consumer state, and the resource kinds, using fixed-width LE fields and explicit padding.
-- **`procctl-gen` emits:** C structs with `_Static_assert(offsetof)`, Go codecs with explicit offsets, and golden vectors.
-- **cgo offset tests** cross-check the generator on amd64 and arm64.
+### 5.5 Wire structs and consumer schemas: C is the source, Go is generated
+- **procctl's wire structs are defined only in `c/procctl.h`,** with `_Static_assert`s pinning each to its SPEC size. `types_gen.go` is generated from them with `go tool cgo -godefs` (`scripts/gen-types.sh`, the approach ebpf-profiler uses in `support/`), and committed. CI fails if it's stale.
+- **Consumers do the same:**
+  - they declare their payload and state as C structs in their own header (fixed-width fields, explicit padding, no bitfields or unions);
+  - they generate the agent-side Go types with their own `types_def.go` and `cgo -godefs`;
+  - they encode and decode with `encoding/binary`.
+- **No schema language, no code generator of our own, no golden vectors:** with a single source there is nothing to cross-check, only staleness.
+- **Who needs a C compiler:** only whoever regenerates.
 
 ---
 
@@ -444,7 +448,7 @@ In all of these, clients run on their defaults and never acquire exclusive resou
    - `state_set` and `resource_report`: 4 KiB in under 2 µs;
    - Go `ReadState`: about 5 µs per read.
 7. **Kernel and feature report** in every job, including a futex-on-read-only-mapping probe.
-8. **cgo offset checks** for the header, control block, grant and resource entries, the state header, and generated schemas.
+8. **Generated-types check** (in place of the originally planned cgo offset checks): `scripts/gen-types.sh --check` verifies that `types_gen.go` matches `c/procctl.h`. The layout has only one source, and `_Static_assert`s pin its sizes to SPEC.
 9. **Static checks:**
    - C11 `-Werror` under gcc and clang, and as C++;
    - hidden symbols only;
@@ -492,10 +496,9 @@ Durations assume 1 engineer and are rough.
   - **hand-over about 50 ms after the holder is SIGKILLed;**
   - a SIGSTOPped holder blocks the resource, and it's reported.
 - **Conformance:**
-  - **wire layout declared once per language as structs:** Go wire structs with `unsafe.Offsetof`/`Sizeof`, C structs with `offsetof`/`sizeof`, each pinned to the spec sizes at compile time. The C/Go check compares every field offset, without cgo;
+  - **wire layout defined once, in C:** the Go wire types are generated from `c/procctl.h` with `go tool cgo -godefs` (`types_gen.go`); CI fails if they're stale;
   - Go↔C stress: 30 s on arm64 (Grace) gave 26.5 billion polls, 237k generations, 45M grant reads, 1.8M state reads, **zero torn data accepted**;
   - Go fuzzing (header, state, agent area); C libFuzzer (2.6M runs, clean);
-  - `procctl-gen` with C and Go golden vectors.
 - **Benchmarks (`make bench`):**
 
   | | amd64 (i7-1370P) | arm64 (GB10) |
@@ -506,14 +509,13 @@ Durations assume 1 engineer and are rough.
   The new hardware CRC32C (SSE4.2 / ARMv8, chosen at runtime) took a 4 KiB config read from 8.7 µs to about 1 µs.
 - **CI:** `.github/workflows/ci.yml` (amd64 + arm64: compile matrix, C tests, Go tests with a 60 s stress run, benchmarks, short fuzzing) and `nightly.yml` (15-minute stress, long model test, long fuzzing; opens an issue on failure).
 - **Deviations:**
-  - schemas are JSON, not YAML (no dependency);
-  - the "cgo offset checks" are a C layout dump compared in Go, because Go forbids cgo in `_test.go` files;
-  - golden vectors cover the generated consumer schemas; the core wire format is covered by the layout check, parser tests and live interop.
+  - there's no schema code generator (`procctl-gen` was built, then dropped): wire structs and consumer schemas are C structs, with Go generated by `cgo -godefs` (§5.5);
+  - so there are no cgo offset tests and no golden vectors, only a staleness check.
 
 - **C side:** `grant_get`, `resource_report`, `grant_usable`, and the reference holder loop in `examples/token`.
 - **Go side:** `exclusive.Arbiter` with RoundRobin, renewal-by-transfer, adoption and blocked reporting.
-- **Tests:** arbiter model tests (§8.4), golden vectors, interop, stress, fuzzing, benchmarks, offset checks, static checks.
-- **Tooling:** `procctl-gen`; `ci.yml` on amd64 and arm64; a kind smoke test.
+- **Tests:** arbiter model tests (§8.4), interop, stress, fuzzing, benchmarks, generated-types staleness check, static checks.
+- **Tooling:** `scripts/gen-types.sh` (`cgo -godefs`); `ci.yml` on amd64 and arm64; a kind smoke test.
 - **Demo:** `examples/token` with three processes rotating a simulated resource on one host. Killing the holder hands over immediately; SIGSTOPping it blocks without overlap. The model tests run green in CI.
 
 ### M3 — Test images and the e2e suite (≈3 weeks)
@@ -591,7 +593,7 @@ Durations assume 1 engineer and are rough.
 
 1. **The contract:** SPEC.md 1.0 final, `docs/kernel-floor.md`.
 2. **C API:** `procctl.h` v0.1.0 with its guarantees (no allocation, threads, constructors or exit hooks; one-load `poll`) and benchmark numbers.
-3. **Go API:** `procctl`, `procctl/exclusive`, `procctl/hello` and `cmd/procctl-gen`, with godoc.
+3. **Go API:** `procctl`, `procctl/exclusive` and `procctl/hello`, with godoc. Plus the `cgo -godefs` recipe for consumer schemas (§5.5).
 4. **Integration guide:**
    - **schema and vendoring:** schema files and vendoring;
    - **config path:** where to `poll()`, apply-then-ack;

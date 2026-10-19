@@ -255,7 +255,7 @@ func (c *Client) markDone() { c.doneOnce.Do(func() { close(c.done) }) }
 func (c *Client) Owned() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.owned && c.area.cb().WriterID.Load() == c.opt.Identity.WriterID
+	return c.owned && ld64(&c.area.cb().Writer_id) == c.opt.Identity.WriterID
 }
 
 // claimLocked tries to become the owner (SPEC §8.1).
@@ -264,28 +264,28 @@ func (c *Client) claimLocked(now time.Time) bool {
 		return false
 	}
 	id := c.opt.Identity
-	w := c.area.cb().WriterID.Load()
+	w := ld64(&c.area.cb().Writer_id)
 	if w == id.WriterID {
 		c.owned = true
 		return true
 	}
-	hb := c.area.cb().HeartbeatNS.Load()
+	hb := ld64(&c.area.cb().Heartbeat_ns)
 	if hb != c.hbSeen || c.hbSeenAt.IsZero() {
 		c.hbSeen, c.hbSeenAt = hb, now
 	}
 	may := w == 0 ||
-		c.area.cb().WriterFlags.Load()&writerReleased != 0 ||
+		ld32(&c.area.cb().Writer_flags)&writerReleased != 0 ||
 		c.ownerGone() ||
-		(c.area.cb().LeaseNS.Load() != 0 &&
-			now.Sub(c.hbSeenAt) > time.Duration(c.area.cb().LeaseNS.Load()))
-	if !may || !c.area.cb().WriterID.CompareAndSwap(w, id.WriterID) {
+		(ld64(&c.area.cb().Lease_ns) != 0 &&
+			now.Sub(c.hbSeenAt) > time.Duration(ld64(&c.area.cb().Lease_ns)))
+	if !may || !cas64(&c.area.cb().Writer_id, w, id.WriterID) {
 		c.owned = false
 		return false
 	}
-	c.area.cb().WriterPID.Store(id.PID)
-	c.area.cb().WriterStart.Store(id.Start)
-	c.area.cb().WriterFlags.Store(0)
-	c.area.cb().LeaseNS.Store(uint64(c.opt.Lease))
+	st32(&c.area.cb().Writer_pid, id.PID)
+	st64(&c.area.cb().Writer_start, id.Start)
+	st32(&c.area.cb().Writer_flags, 0)
+	st64(&c.area.cb().Lease_ns, uint64(c.opt.Lease))
 	c.heartbeatLocked()
 	c.owned = true
 	c.adoptLocked()
@@ -302,17 +302,17 @@ func (c *Client) adoptLocked() {
 	}
 	c.pubValid = true
 	c.pubGen = gen
-	c.pubFlags = c.area.cb().Flags.Load()
+	c.pubFlags = ld32(&c.area.cb().Flags)
 	c.pubPayload = append([]byte(nil), payload...)
 	c.pubGrants = grants
-	c.pubLen = c.area.cb().PayloadLen.Load()
-	c.pubCRC = c.area.cb().PayloadCRC32.Load()
+	c.pubLen = ld32(&c.area.cb().Payload_len)
+	c.pubCRC = ld32(&c.area.cb().Payload_crc32c)
 }
 
 // ownerGone: claim rule 3. Only meaningful when agents share a pid namespace.
 func (c *Client) ownerGone() bool {
-	pid := c.area.cb().WriterPID.Load()
-	want := c.area.cb().WriterStart.Load()
+	pid := ld32(&c.area.cb().Writer_pid)
+	want := ld64(&c.area.cb().Writer_start)
 	if pid == 0 {
 		return false
 	}
@@ -325,11 +325,11 @@ func (c *Client) ownerGone() bool {
 
 func (c *Client) heartbeatLocked() {
 	now := uint64(bootNow())
-	prev := c.area.cb().HeartbeatNS.Load()
+	prev := ld64(&c.area.cb().Heartbeat_ns)
 	if now <= prev {
 		now = prev + 1
 	}
-	c.area.cb().HeartbeatNS.Store(now)
+	st64(&c.area.cb().Heartbeat_ns, now)
 }
 
 // Write publishes a consumer payload and grant table as one generation.
@@ -372,7 +372,7 @@ func (c *Client) writeLocked(payload []byte, valid bool, grants []Grant) (uint64
 	if !c.owned && !c.claimLocked(time.Now()) {
 		return 0, nil, ErrNotOwner
 	}
-	if c.area.cb().WriterID.Load() != c.opt.Identity.WriterID {
+	if ld64(&c.area.cb().Writer_id) != c.opt.Identity.WriterID {
 		c.owned = false
 		return 0, nil, ErrPreempted
 	}
@@ -392,8 +392,8 @@ func (c *Client) writeLocked(payload []byte, valid bool, grants []Grant) (uint64
 	c.pubPayload = append([]byte(nil), payload...)
 	c.pubGrants = out
 	c.pubFlags = flags
-	c.pubLen = c.area.cb().PayloadLen.Load()
-	c.pubCRC = c.area.cb().PayloadCRC32.Load()
+	c.pubLen = ld32(&c.area.cb().Payload_len)
+	c.pubCRC = ld32(&c.area.cb().Payload_crc32c)
 	return gen, out, nil
 }
 
@@ -411,16 +411,16 @@ func (c *Client) Heartbeat() error {
 		}
 		return nil
 	}
-	if c.area.cb().WriterID.Load() != c.opt.Identity.WriterID {
+	if ld64(&c.area.cb().Writer_id) != c.opt.Identity.WriterID {
 		c.owned = false
 		return ErrPreempted
 	}
 	c.heartbeatLocked()
-	if c.pubValid && (c.area.cb().PayloadLen.Load() != c.pubLen || c.area.cb().PayloadCRC32.Load() != c.pubCRC) {
+	if c.pubValid && (ld32(&c.area.cb().Payload_len) != c.pubLen || ld32(&c.area.cb().Payload_crc32c) != c.pubCRC) {
 		if gen, _, err := c.area.write(c.pubPayload, c.pubGrants, c.pubFlags); err == nil {
 			c.pubGen = gen
-			c.pubLen = c.area.cb().PayloadLen.Load()
-			c.pubCRC = c.area.cb().PayloadCRC32.Load()
+			c.pubLen = ld32(&c.area.cb().Payload_len)
+			c.pubCRC = ld32(&c.area.cb().Payload_crc32c)
 		}
 	}
 	return nil
@@ -469,9 +469,9 @@ func (c *Client) release(clear bool) {
 		return
 	}
 	if clear {
-		c.area.cb().WriterID.CompareAndSwap(c.opt.Identity.WriterID, 0)
-	} else if c.area.cb().WriterID.Load() == c.opt.Identity.WriterID {
-		c.area.cb().WriterFlags.Store(writerReleased)
+		cas64(&c.area.cb().Writer_id, c.opt.Identity.WriterID, 0)
+	} else if ld64(&c.area.cb().Writer_id) == c.opt.Identity.WriterID {
+		st32(&c.area.cb().Writer_flags, writerReleased)
 	}
 	c.owned = false
 }

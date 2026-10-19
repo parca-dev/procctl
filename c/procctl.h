@@ -43,14 +43,14 @@ extern "C" {
  * against them field by field (TestLayoutMatchesC). */
 
 struct procctl_wire_header { /* SPEC §4: page 0, written once by the process */
-  char signature[8];          /* "PROC_CTL", not NUL-terminated */
+  uint8_t signature[8];       /* "PROC_CTL", not NUL-terminated */
   uint16_t spec_major;
   uint16_t spec_minor;
   uint32_t header_size;
   uint64_t total_size;
   uint32_t page_size;
   uint32_t flags;
-  char consumer[32];          /* NUL-padded [a-z0-9_]{1,31} */
+  uint8_t consumer[32];       /* NUL-padded [a-z0-9_]{1,31} */
   uint32_t schema_version;
   uint32_t creator_pid;
   uint64_t agent_area_off;
@@ -89,7 +89,7 @@ struct procctl_grant_entry { /* SPEC §5.2: follows the control block */
 };
 
 struct procctl_state_hdr { /* SPEC §6: in this process's own memory */
-  char magic[8];              /* "PROCSTAT" */
+  uint8_t magic[8];           /* "PROCSTAT" */
   uint64_t seq;
   uint64_t instance_id;
   uint32_t writer_pid;
@@ -125,6 +125,10 @@ struct procctl_res_entry { /* SPEC §6.1: follows the state header */
 #define PROCCTL_RES_RELEASED 3u
 #define PROCCTL_RES_FAILED 4u
 #define PROCCTL_RES_F_WANT 1u
+
+/* Control block flags (SPEC §5.1). */
+#define PROCCTL_CTRL_F_PAYLOAD_VALID 1u /* procctl_ctrl.flags */
+#define PROCCTL_WRITER_F_RELEASED 1u    /* procctl_ctrl.writer_flags */
 
 /* procctl_config.flags */
 #define PROCCTL_F_NO_HELLO 1u
@@ -1279,7 +1283,7 @@ PROCCTL_DEF int procctl__poll_slow(struct procctl__ctx *c, uint64_t s1, void *bu
     int r = pc__read_payload(c, s1, NULL, (uint8_t *)buf, cap, &n, &flags);
     if (r == 0) {
       if (gen) *gen = s1;
-      if (!(flags & 1u) || n == 0) return -ENODATA; /* PAYLOAD_VALID clear: use defaults */
+      if (!(flags & PROCCTL_CTRL_F_PAYLOAD_VALID) || n == 0) return -ENODATA; /* use defaults */
       return (int)n;
     }
     if (r == -E2BIG) return -E2BIG;

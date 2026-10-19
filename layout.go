@@ -10,141 +10,72 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
-	"sync/atomic"
 	"unsafe"
 )
 
-// Spec version implemented by this package.
-const (
-	SpecMajor = 1
-	SpecMinor = 0
-)
+//go:generate scripts/gen-types.sh
 
-// Limits (SPEC §4, §10.2).
-const (
-	MaxSlots         = 64
-	MaxStateSize     = 65536
-	DefaultMaxRegion = 4 << 20
-)
+// The wire layout is defined once, in c/procctl.h. types_gen.go is generated
+// from it by `go tool cgo -godefs` (scripts/gen-types.sh): the wire structs
+// (wireHeader, ctrlBlock, grantEntry, stateHeader, resEntry), the spec
+// version, limits, flags and resource states. Sizes and the few offsets the
+// code needs are derived from those structs.
 
-// ---- Wire structs -------------------------------------------------------------
-//
-// These mirror SPEC §4–§6 field for field. All layout sizes and offsets are
-// derived from them; the assertions below pin each one to the size the spec
-// gives, and TestLayoutMatchesC checks every field offset against procctl.h.
-// Encoding is little-endian; the agent runs only on little-endian hosts.
+// DefaultMaxRegion is the default largest region an agent maps (SPEC §10.2).
+const DefaultMaxRegion = 4 << 20
 
-// wireHeader is the region header (SPEC §4).
-type wireHeader struct {
-	Signature     [8]byte
-	SpecMajor     uint16
-	SpecMinor     uint16
-	HeaderSize    uint32
-	TotalSize     uint64
-	PageSize      uint32
-	Flags         uint32
-	Consumer      [32]byte
-	SchemaVersion uint32
-	CreatorPID    uint32
-	AgentAreaOff  uint64
-	AgentAreaSize uint64
-	StateAddr     uint64
-	StateSize     uint32
-	ResourceSlots uint16
-	_             uint16
-	CreatedAtNS   uint64
-	InstanceID    uint64
-	HeaderCRC     uint32
-	_             uint32
-}
-
-// ctrlBlock is the agent area's control block (SPEC §5.1). The agent
-// accesses it in place, through atomics, overlaid on the shared mapping.
-type ctrlBlock struct {
-	Seq          atomic.Uint64
-	PayloadLen   atomic.Uint32
-	Flags        atomic.Uint32
-	WriterID     atomic.Uint64
-	HeartbeatNS  atomic.Uint64
-	LeaseNS      atomic.Uint64
-	WriterPID    atomic.Uint32
-	WriterFlags  atomic.Uint32
-	WriterStart  atomic.Uint64
-	PayloadCRC32 atomic.Uint32
-	_            uint32
-}
-
-// Grant is one grant-table entry (SPEC §5.2).
-type Grant struct {
-	ID       [16]byte
-	GrantID  uint64 // 0 on Write means "new grant": it gets the write's generation (§9.3)
-	Duration uint64 // nanoseconds
-	Kind     uint32
-	_        uint32 // flags, reserved
-	_        uint64
-}
-
-// stateHeader is the fixed part of a state block (SPEC §6).
-type stateHeader struct {
-	Magic           [8]byte
-	Seq             uint64
-	InstanceID      uint64
-	WriterPID       uint32
-	StateLen        uint32
-	AppliedGen      uint64
-	AppliedWriterID uint64
-	GrantsSeenGen   uint64
-	CRC32           uint32
-	_               uint32
-}
-
-// ResourceEntry is one resource-table entry of a state block (SPEC §6.1).
-type ResourceEntry struct {
-	ID             [16]byte
-	GrantID        uint64
-	LastActivityNS uint64
-	Kind           uint32
-	State          uint32
-	Flags          uint32
-	Error          uint32
-}
-
-// Sizes, derived from the structs.
+// Sizes and offsets, derived from the generated wire structs.
 const (
 	HeaderSize   = int(unsafe.Sizeof(wireHeader{}))
 	CtrlSize     = int(unsafe.Sizeof(ctrlBlock{}))
-	EntrySize    = int(unsafe.Sizeof(Grant{}))
+	EntrySize    = int(unsafe.Sizeof(grantEntry{}))
 	StateHdrSize = int(unsafe.Sizeof(stateHeader{}))
-	resEntrySize = int(unsafe.Sizeof(ResourceEntry{}))
-	headerCRCOff = int(unsafe.Offsetof(wireHeader{}.HeaderCRC))
+	resEntrySize = int(unsafe.Sizeof(resEntry{}))
+	headerCRCOff = int(unsafe.Offsetof(wireHeader{}.Header_crc32c))
 	stateSeqOff  = int(unsafe.Offsetof(stateHeader{}.Seq))
-	stateCRCOff  = int(unsafe.Offsetof(stateHeader{}.CRC32))
-)
-
-// Compile-time checks that the structs have exactly the spec's sizes (a
-// negative array length fails the build) and that both entry kinds agree.
-var (
-	_ [HeaderSize - 128]struct{}
-	_ [128 - HeaderSize]struct{}
-	_ [CtrlSize - 64]struct{}
-	_ [64 - CtrlSize]struct{}
-	_ [EntrySize - 48]struct{}
-	_ [48 - EntrySize]struct{}
-	_ [resEntrySize - EntrySize]struct{}
-	_ [EntrySize - resEntrySize]struct{}
-	_ [StateHdrSize - 64]struct{}
-	_ [64 - StateHdrSize]struct{}
+	stateCRCOff  = int(unsafe.Offsetof(stateHeader{}.Crc32c))
 )
 
 const (
 	signature   = "PROC_CTL"
 	stateMagic  = "PROCSTAT"
 	memfdPrefix = "/memfd:procctl:"
-
-	// Control block flags (SPEC §5.1).
-	FlagPayloadValid = 1 << 0
-	writerReleased   = 1 << 0
 )
+
+// Grant is one grant-table entry (SPEC §5.2), as used by the API.
+type Grant struct {
+	Kind     uint32
+	ID       [16]byte
+	GrantID  uint64 // 0 on Write means "new grant": it gets the write's generation (§9.3)
+	Duration uint64 // nanoseconds
+}
+
+func (g Grant) wire() grantEntry {
+	return grantEntry{Resource_id: g.ID, Grant_id: g.GrantID, Duration_ns: g.Duration, Kind: g.Kind}
+}
+
+func grantFromWire(e grantEntry) Grant {
+	return Grant{Kind: e.Kind, ID: e.Resource_id, GrantID: e.Grant_id, Duration: e.Duration_ns}
+}
+
+// ResourceEntry is one resource-table entry of a state block (SPEC §6.1), as
+// used by the API.
+type ResourceEntry struct {
+	Kind           uint32
+	ID             [16]byte
+	GrantID        uint64
+	State          uint32
+	Flags          uint32
+	Error          uint32
+	LastActivityNS uint64
+}
+
+func resourceFromWire(e resEntry) ResourceEntry {
+	return ResourceEntry{
+		Kind: e.Kind, ID: e.Resource_id, GrantID: e.Grant_id, State: e.State,
+		Flags: e.Flags, Error: e.Error, LastActivityNS: e.Last_activity_ns,
+	}
+}
 
 var castagnoli = crc32.MakeTable(crc32.Castagnoli)
 
@@ -203,11 +134,11 @@ func ParseHeader(b []byte, fileSize uint64) (Header, error) {
 	if string(w.Signature[:]) != signature {
 		return h, invalid("bad signature")
 	}
-	if crc32c(b[:headerCRCOff]) != w.HeaderCRC {
+	if crc32c(b[:headerCRCOff]) != w.Header_crc32c {
 		return h, invalid("header crc mismatch")
 	}
-	if w.SpecMajor != SpecMajor {
-		return h, invalid("spec major %d not supported", w.SpecMajor)
+	if w.Spec_major != SpecMajor {
+		return h, invalid("spec major %d not supported", w.Spec_major)
 	}
 	n := bytes.IndexByte(w.Consumer[:], 0)
 	if n < 0 {
@@ -227,11 +158,11 @@ func ParseHeader(b []byte, fileSize uint64) (Header, error) {
 		}
 	}
 	h = Header{
-		SpecMajor: w.SpecMajor, SpecMinor: w.SpecMinor, TotalSize: w.TotalSize,
-		PageSize: w.PageSize, Consumer: string(w.Consumer[:n]), SchemaVersion: w.SchemaVersion,
-		CreatorPID: w.CreatorPID, AreaOff: w.AgentAreaOff, AreaSize: w.AgentAreaSize,
-		StateAddr: w.StateAddr, StateSize: w.StateSize, ResourceSlots: w.ResourceSlots,
-		CreatedAtNS: w.CreatedAtNS, InstanceID: w.InstanceID,
+		SpecMajor: w.Spec_major, SpecMinor: w.Spec_minor, TotalSize: w.Total_size,
+		PageSize: w.Page_size, Consumer: string(w.Consumer[:n]), SchemaVersion: w.Schema_version,
+		CreatorPID: w.Creator_pid, AreaOff: w.Agent_area_off, AreaSize: w.Agent_area_size,
+		StateAddr: w.State_addr, StateSize: w.State_size, ResourceSlots: w.Resource_slots,
+		CreatedAtNS: w.Created_at_ns, InstanceID: w.Instance_id,
 	}
 
 	p := uint64(h.PageSize)
@@ -276,11 +207,11 @@ func (h *Header) PayloadCapacity() int {
 // encodeHeader builds a header; used by tests and tools that create regions.
 func encodeHeader(h Header) []byte {
 	w := wireHeader{
-		SpecMajor: h.SpecMajor, SpecMinor: h.SpecMinor, HeaderSize: uint32(HeaderSize),
-		TotalSize: h.TotalSize, PageSize: h.PageSize, SchemaVersion: h.SchemaVersion,
-		CreatorPID: h.CreatorPID, AgentAreaOff: h.AreaOff, AgentAreaSize: h.AreaSize,
-		StateAddr: h.StateAddr, StateSize: h.StateSize, ResourceSlots: h.ResourceSlots,
-		CreatedAtNS: h.CreatedAtNS, InstanceID: h.InstanceID,
+		Spec_major: h.SpecMajor, Spec_minor: h.SpecMinor, Header_size: uint32(HeaderSize),
+		Total_size: h.TotalSize, Page_size: h.PageSize, Schema_version: h.SchemaVersion,
+		Creator_pid: h.CreatorPID, Agent_area_off: h.AreaOff, Agent_area_size: h.AreaSize,
+		State_addr: h.StateAddr, State_size: h.StateSize, Resource_slots: h.ResourceSlots,
+		Created_at_ns: h.CreatedAtNS, Instance_id: h.InstanceID,
 	}
 	copy(w.Signature[:], signature)
 	copy(w.Consumer[:31], h.Consumer)

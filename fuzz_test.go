@@ -29,10 +29,10 @@ func FuzzParseHeader(f *testing.F) {
 }
 
 func validStateBlock(h *Header, pid uint32) []byte {
-	sh := stateHeader{Seq: 6, InstanceID: h.InstanceID, WriterPID: pid, StateLen: 5, AppliedGen: 4}
+	sh := stateHeader{Seq: 6, Instance_id: h.InstanceID, Writer_pid: pid, State_len: 5, Applied_gen: 4}
 	copy(sh.Magic[:], stateMagic)
-	table := make([]ResourceEntry, h.ResourceSlots)
-	table[0] = ResourceEntry{ID: [16]byte{0x42}, GrantID: 4, Kind: 1, State: ResHolding}
+	table := make([]resEntry, h.ResourceSlots)
+	table[0] = resEntry{Resource_id: [16]byte{0x42}, Grant_id: 4, Kind: 1, State: ResHolding}
 	var buf bytes.Buffer
 	encode(&buf, &sh)
 	encode(&buf, table)

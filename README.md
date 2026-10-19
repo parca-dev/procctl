@@ -149,6 +149,23 @@ go arb.Run(ctx)
 arb.Snapshot() // holder, hold time, pending releases, blocked time per resource
 ```
 
+## One definition of the wire layout
+
+The wire structs are defined only in C, in `c/procctl.h`. The Go agent's versions are generated from that header, the way ebpf-profiler does it in `support/`:
+
+```
+types_def.go (//go:build ignore)          types_gen.go (committed, DO NOT EDIT)
+  type ctrlBlock C.struct_procctl_ctrl  →   type ctrlBlock struct { Seq uint64; Payload_len uint32; ... }
+  ResHolding = C.PROCCTL_RES_HOLDING    →   ResHolding = 0x2
+```
+
+- **Regenerate:** `make generate` (= `scripts/gen-types.sh`, which runs `go tool cgo -godefs`).
+- **Check:** CI runs `scripts/gen-types.sh --check` and fails if `types_gen.go` is stale.
+- **Who needs a C compiler:** only whoever regenerates. Users of the Go module don't.
+- **Sizes:** `_Static_assert`s in `procctl.h` pin every struct to the size SPEC.md gives.
+
+**Consumer schemas work the same way.** A consumer declares its payload and state as C structs in its own header (fixed-width fields, explicit padding, no bitfields or unions). Its agent-side Go types come from a `types_def.go` of its own run through `go tool cgo -godefs`. The Go side encodes and decodes them with `encoding/binary` (little-endian).
+
 ## Layout
 
 | Path | What |
@@ -157,7 +174,7 @@ arb.Snapshot() // holder, hold time, pending releases, blocked time per resource
 | `c/procctl.h` | The process side: one vendorable header (stb-style). No allocation, threads, constructors, or exit/fork hooks. |
 | `*.go` | The agent side (`github.com/parca-dev/procctl`): `Registry`, `Client`, `Scan`, `Attach`. |
 | `exclusive/` | The arbiter for exclusive resources, with its model tests. |
-| `cmd/procctl-gen`, `schemas/` | Generates matching C structs and Go codecs for a consumer's payload and state, plus golden vectors. |
+| `types_def.go` → `types_gen.go` | The Go wire types, generated from `c/procctl.h` with `go tool cgo -godefs` (`scripts/gen-types.sh`). |
 | `examples/echo` | A config-only consumer: C client, Go agent, `demo.sh`. |
 | `examples/token` | An exclusive-resource consumer: C holder with a control thread, Go agent with the arbiter. |
 | `spike/pcsampling` | The PC sampling experiments behind SPEC §9 (`FINDINGS.md`). |
