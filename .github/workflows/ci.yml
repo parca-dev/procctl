@@ -1,0 +1,70 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Install compilers
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang
+      - name: Kernel and feature report
+        run: make -s kernel-report | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: procctl.h compile matrix (gcc/clang, C/C++, system/bundled sdt.h)
+        run: make -s test-c-compile
+      - name: C unit tests (ASan/UBSan)
+        run: make -s test-c
+      - name: Go vet
+        run: go vet ./...
+      - name: Go tests (-race; interop, conformance, 60 s stress, arbiter model and real holders)
+        env:
+          PROCCTL_STRESS_SECONDS: "60"
+        run: go test -race -count=1 -timeout 20m ./...
+      - name: poll() benchmark
+        run: |
+          {
+            echo "### poll() benchmark (${{ matrix.arch }})"
+            echo '```'
+            make -s bench
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+  fuzz:
+    name: fuzz (short)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Install clang
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang
+      - name: Go fuzzing (60 s per target)
+        run: make -s fuzz-go FUZZTIME=60s
+      - name: C libFuzzer (60 s)
+        run: make -s fuzz-c FUZZSECS=60

@@ -239,7 +239,7 @@ The process is the only writer. A multi-threaded process MUST serialize its writ
 2. write the fields, the resource table and the consumer state; compute crc32c last
 3. store(seq, seq + 1, release)                         // even
 ```
-After an update the process MAY fire the `procctl:state` probe (§11).
+After an update the process MAY fire the `procctl:state` debugging probe (§11.2).
 
 ### 7.3 Remote read of the state block (agent)
 
@@ -265,7 +265,13 @@ Ordering note (informative): the reader's two `seq` reads and its block read are
   - a writer whose step-4 CAS fails has been preempted, and MUST stop writing until it re-establishes ownership (§8.1).
 - **A preempted writer may have overwritten payload bytes;** readers then see a CRC mismatch or that writer's complete payload. The owner MUST, at least once per heartbeat interval, compare `payload_crc32c` and `payload_len` with what it last published, and republish if they differ.
 
-### 7.5 Memory model note (informative)
+### 7.5 Write rate (informative)
+
+A seqlock reader only succeeds when it doesn't overlap a write. A writer that writes continuously starves every reader: in procctl's stress tests, back-to-back 16 KiB writes left the readers with almost no clean reads.
+
+So writers SHOULD leave gaps between writes. Agents naturally do, since configuration changes are rare. A process SHOULD rate-limit state updates (for example to at most 1 kHz), and SHOULD NOT update its state block in a tight loop.
+
+### 7.6 Memory model note (informative)
 
 Neither the C11 nor the Go memory model formally covers memory shared across processes. This protocol relies on atomic accesses and fences lowering to the corresponding hardware instructions (x86-64 TSO; ARMv8 LDAR/STLR/LDAXR/STLXR/DMB).
 
@@ -363,7 +369,11 @@ Resources MUST be per-process: a holding is never inherited by a forked child.
     - X's resource-table entry for R is absent or in a does-not-hold state (`IDLE`, `RELEASED`, `FAILED`);
   - a valid state read of X shows R `RELEASED` or `FAILED` with `grant_id = G`.
 - **A3 — never by timeout.** Elapsed time, read failures, missing state, or a stale state block (§12) MUST NOT confirm a release. An arbiter that can't confirm a release MUST keep the grant outstanding and SHOULD report the resource as blocked.
-- **A4 — adopt on claim.** An agent that claims a region (§8.1) MUST treat every grant in that region's current grant table as outstanding until it confirms the release.
+- **A4 — adopt on claim.** An agent that claims a region (§8.1) MUST:
+  - treat every grant in that region's current grant table as outstanding until it confirms the release; and
+  - record the generation G0 it found at claim time. Until a valid state read of that process shows `grants_seen_gen ≥ G0`, or the process exits, the arbiter MUST treat the process as a possible holder of every resource it lists in its resource table (and of every resource of the arbiter's kinds, if its state has never been read).
+
+  The second rule exists because a holder can read a grant table, then stall before acting on it. If the previous agent revoked that grant but couldn't confirm the release, the new agent can't see the grant in the table or a may-hold state, and would otherwise re-grant the resource. Found by the arbiter model tests (`exclusive/model_test.go`).
 - **A5 — discover before granting.** Before issuing any grant for R, the agent MUST have:
   - completed one full discovery pass (§10.1);
   - read the state of every attached process with R in its resource table, treating any such process whose entry shows may-hold, or whose state can't be read, as an outstanding holder.
@@ -434,15 +444,29 @@ The agent SHOULD `mprotect` its view of the header page to `PROT_READ`, and SHOU
 
 ## 11. Probes
 
-The process SHOULD define these USDT probes (SystemTap SDT notes in `.note.stapsdt`):
+Probes are USDT probes (SystemTap SDT notes in `.note.stapsdt`). Agents MAY find them by reading the ELF notes of mapped objects.
+
+### 11.1 Discovery probe
+
+The process SHOULD define:
 
 | Provider | Name | When | Arguments |
 |---|---|---|---|
 | `procctl` | `hello` | after creating a region (§3.1 step 8), including `reinit` (§12) | `arg1`: s32 region fd; `arg2`: pointer to the NUL-terminated memfd name; `arg3`: s32 `getpid()` |
-| `procctl` | `state` | after each state-block update (OPTIONAL) | `arg1`: u64 state `seq`; `arg2`: u64 `grants_seen_gen` |
 
-- Agents MAY find the probes by reading the ELF notes of mapped objects.
-- Probe arguments are hints. An agent MUST still discover and validate regions through §10, and MUST still confirm releases through state reads (§9.2).
+`hello` lets an agent attach immediately instead of waiting for its next scan. Its arguments are hints: an agent MUST still discover and validate the region through §10.
+
+### 11.2 Debugging probe
+
+The process MAY define:
+
+| Provider | Name | When | Arguments |
+|---|---|---|---|
+| `procctl` | `state` | after each state-block update, only when the consumer enables it | `arg1`: u64 state `seq`; `arg2`: u64 `grants_seen_gen` |
+
+`state` exists for tracing and debugging, for example watching acks and resource transitions with `bpftrace`, including in stripped binaries.
+- Agents MUST NOT use it for protocol decisions. Acks and releases are known only from state reads (§8.2, §9.2).
+- Consumers SHOULD leave it disabled in production. While a tracer is attached, every state update takes a uprobe trap, possibly on an application thread.
 
 ---
 

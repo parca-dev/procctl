@@ -21,17 +21,6 @@ const (
 	ResFlagWant  = 1 << 0
 )
 
-// ResourceEntry is one entry of a process's resource table (SPEC §6.1).
-type ResourceEntry struct {
-	Kind           uint32
-	ID             [16]byte
-	GrantID        uint64
-	State          uint32
-	Flags          uint32
-	Error          uint32
-	LastActivityNS uint64
-}
-
 // MayHold reports whether the entry claims the resource may be in use.
 func (e ResourceEntry) MayHold() bool {
 	return e.State == ResAcquiring || e.State == ResHolding
@@ -89,7 +78,8 @@ func remoteReadU64(pid int, addr uint64) (uint64, error) {
 // readStateOnce performs the SPEC §7.3 procedure once.
 func readStateOnce(pid int, h *Header, innermostNSPid int) (State, error) {
 	var st State
-	s1, err := remoteReadU64(pid, h.StateAddr+sSeq)
+	seqAddr := h.StateAddr + uint64(stateSeqOff)
+	s1, err := remoteReadU64(pid, seqAddr)
 	if err != nil {
 		return st, err
 	}
@@ -100,56 +90,60 @@ func readStateOnce(pid int, h *Header, innermostNSPid int) (State, error) {
 	if err := remoteRead(pid, h.StateAddr, buf); err != nil {
 		return st, err
 	}
-	s2, err := remoteReadU64(pid, h.StateAddr+sSeq)
+	s2, err := remoteReadU64(pid, seqAddr)
 	if err != nil {
 		return st, err
 	}
-	if s1 != s2 || le.Uint64(buf[sSeq:]) != s1 {
+	if s1 != s2 || le.Uint64(buf[stateSeqOff:]) != s1 {
 		return st, ErrStateBusy
 	}
-	if string(buf[sMagic:sMagic+8]) != stateMagic || le.Uint64(buf[sInstance:]) != h.InstanceID {
+	return parseState(buf, h, innermostNSPid)
+}
+
+// parseState validates and decodes a state block copied out of a process.
+// It is pure, so it can be fuzzed and tested against golden vectors.
+func parseState(buf []byte, h *Header, innermostNSPid int) (State, error) {
+	var st State
+	var sh stateHeader
+	if len(buf) < StateHdrSize || len(buf) > MaxStateSize || decode(buf, &sh) != nil {
 		return st, ErrStateInvalid
 	}
-	slots := int(h.ResourceSlots)
-	n := int(le.Uint32(buf[sLen:]))
-	used := StateHdrSize + slots*EntrySize + n
+	if sh.Seq&1 == 1 || sh.Seq == 0 {
+		return st, ErrStateBusy
+	}
+	if string(sh.Magic[:]) != stateMagic || sh.InstanceID != h.InstanceID {
+		return st, ErrStateInvalid
+	}
+	tableEnd := StateHdrSize + int(h.ResourceSlots)*resEntrySize
+	used := tableEnd + int(sh.StateLen)
 	if used > len(buf) {
 		return st, ErrStateInvalid
 	}
-	want := le.Uint32(buf[sCRC:])
-	chk := make([]byte, used)
-	copy(chk, buf[:used])
-	clear(chk[sSeq : sSeq+8])
-	clear(chk[sCRC : sCRC+4])
-	if crc32c(chk) != want {
+	// CRC over the used block with seq and crc32c taken as zero (SPEC §6).
+	chk := append([]byte(nil), buf[:used]...)
+	clear(chk[stateSeqOff : stateSeqOff+8])
+	clear(chk[stateCRCOff : stateCRCOff+4])
+	if crc32c(chk) != sh.CRC32 {
 		return st, ErrStateBusy // torn across the syscalls, or corrupt
 	}
-	st.Seq = s1
-	st.WriterPID = le.Uint32(buf[sPID:])
-	st.Stale = int(st.WriterPID) != innermostNSPid
-	st.AppliedGen = le.Uint64(buf[sApplied:])
-	st.AppliedWriterID = le.Uint64(buf[sAppliedW:])
-	st.GrantsSeenGen = le.Uint64(buf[sSeen:])
+	st = State{
+		Seq: sh.Seq, WriterPID: sh.WriterPID, AppliedGen: sh.AppliedGen,
+		AppliedWriterID: sh.AppliedWriterID, GrantsSeenGen: sh.GrantsSeenGen,
+		Stale: int(sh.WriterPID) != innermostNSPid,
+	}
 	if st.Stale {
 		return st, nil
 	}
-	for i := 0; i < slots; i++ {
-		e := buf[StateHdrSize+i*EntrySize:]
-		r := ResourceEntry{
-			GrantID:        le.Uint64(e[eGrant:]),
-			LastActivityNS: le.Uint64(e[eActivity:]),
-			Kind:           le.Uint32(e[eKind:]),
-			State:          le.Uint32(e[eState:]),
-			Flags:          le.Uint32(e[eFlags:]),
-			Error:          le.Uint32(e[eError:]),
-		}
-		copy(r.ID[:], e[eID:eID+16])
-		if r.Kind == 0 && r.ID == ([16]byte{}) {
-			continue
-		}
-		st.Resources = append(st.Resources, r)
+	table := make([]ResourceEntry, h.ResourceSlots)
+	if err := decode(buf[StateHdrSize:tableEnd], &table); err != nil {
+		return State{}, ErrStateInvalid
 	}
-	st.Consumer = append([]byte(nil), buf[StateHdrSize+slots*EntrySize:used]...)
+	for _, r := range table {
+		if r.Kind != 0 || r.ID != ([16]byte{}) {
+			st.Resources = append(st.Resources, r)
+		}
+	}
+	st.Consumer = append([]byte(nil), buf[tableEnd:used]...)
 	return st, nil
 }
 

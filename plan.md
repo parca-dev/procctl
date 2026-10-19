@@ -68,7 +68,7 @@ Several lines in the prompt were commented out by accident. All of them are in s
   - the Go reader uses three remote reads (`seq`, block, `seq`) plus a CRC (SPEC §7.3).
 
   Syscall boundaries give no formal ordering guarantee, so the CRC is the backstop.
-- **Cross-process memory model:** documented as an assumption about hardware lowering (SPEC §7.5) and exercised by the arm64 stress tests (§8).
+- **Cross-process memory model:** documented as an assumption about hardware lowering (SPEC §7.6) and exercised by the arm64 stress tests (§8).
 
 ### 2.3 Read-only client
 
@@ -87,7 +87,7 @@ After that it only *reads* the agent area. It acks and reports by updating its s
 
 **Costs:**
 - **Reading state needs ptrace-level access** (`process_vm_readv`). That's the same privilege as `pidfd_getfd`, which the agent already needs.
-- **State changes reach the agent by polling** (a few µs per read). The OPTIONAL `procctl:state` USDT probe gives immediacy.
+- **State changes reach the agent by polling** (a few µs per read; 5 ms cadence while a release is pending). That's fast compared with what a hand-off costs anyway (e.g. CUPTI Disable ~60 ms), so there's no event path. The opt-in `procctl:state` USDT probe is a debugging aid only (SPEC §11.2).
 - **The state block's address is advertised** (`state_addr`). It's only ever used as a remote-read target.
 
 ### 2.4 Exclusive resources, driven by PC sampling
@@ -176,7 +176,7 @@ Unchanged from the previous revision. Three layers, each a fallback for the one 
 
 **Changes in revision 2:**
 - **Removed:** the process area, `publish_status`, process-side shared-memory writes, and the fork re-creation and `MADV_DONTFORK` rules.
-- **Added:** the state block and remote-read protocol; the grant table, resource table, and holder and arbiter rules; the futex wake word; the `procctl:state` probe; and the stale-state rule for fork.
+- **Added:** the state block and remote-read protocol; the grant table, resource table, and holder and arbiter rules; the futex wake word; the opt-in `procctl:state` debugging probe; and the stale-state rule for fork.
 - **Changed:**
   - the header's `proc_area_off/size` become `state_addr`, `state_size` and `resource_slots`;
   - acks move into the state block (`applied_gen`, `applied_writer_id`);
@@ -473,12 +473,43 @@ Durations assume 1 engineer and are rough.
   - hardware CRC32C in C (it uses a table, which is fine for M1 sizes).
 
 - **SPEC.md:** revision 2 reviewed with the parca-agent and parcagpu maintainers.
-- **`procctl.h`:** init, poll, ack, state_set, lease, wait, reinit, hello and state probes.
+- **`procctl.h`:** init, poll, ack, state_set, lease, wait, reinit, the `hello` probe, and the opt-in `state` debugging probe.
 - **Go:** Scan, Attach, Client (Write, ReadState, WaitAck, Heartbeat), Registry with leases and the A5 gate, without hello.
 - **Example consumer:** `examples/echo`.
 - **Demo:** on one host, the client starts first, the agent discovers it, pushes config and sees the ack in the state block. `kill -9` on the agent makes the client fall back to defaults within the lease. A forked child shows a stale state block. A `reinit` child gets a new region.
 
 ### M2 — Exclusive resources, conformance and kind CI (≈3 weeks)
+
+**Status (2026-10-19, branch `m2`): done, except the kind smoke test, which moves to M3** (it needs the M3 container images).
+- **`exclusive.Arbiter`:** implements A1–A6, RoundRobin, renewal by transfer, adoption, foreign-holder blocking, and blocked reporting. `Client` gained `WritePayload`/`WriteGrants`/`Grants`, and adopts the region's grants on claim.
+- **Model tests** (`exclusive/model_test.go`): random schedules with slow, hung, crashing and unreadable holders; holders that act on stale grant-table snapshots; and agent crash/restart with adoption.
+  - **They found a real spec hole,** now fixed: SPEC A4's post-claim `grants_seen_gen ≥ G0` barrier. Without it, a holder that stalled after reading a grant could act on it after an agent restart.
+  - **Mutation testing:** 7 of 8 deliberate arbiter bugs are caught. The 8th is masked by the independent foreign-holder check.
+  - `make model-long` runs 5,000 × 10,000 steps.
+- **`examples/token`:** a C holder with the reference control-thread loop, plus a Go agent. End-to-end tests (`exclusive/token_test.go`) judge overlap from the clients' own logs:
+  - rotation with no overlap;
+  - a lone holder renewed with zero releases;
+  - **hand-over about 50 ms after the holder is SIGKILLed;**
+  - a SIGSTOPped holder blocks the resource, and it's reported.
+- **Conformance:**
+  - **wire layout declared once per language as structs:** Go wire structs with `unsafe.Offsetof`/`Sizeof`, C structs with `offsetof`/`sizeof`, each pinned to the spec sizes at compile time. The C/Go check compares every field offset, without cgo;
+  - Go↔C stress: 30 s on arm64 (Grace) gave 26.5 billion polls, 237k generations, 45M grant reads, 1.8M state reads, **zero torn data accepted**;
+  - Go fuzzing (header, state, agent area); C libFuzzer (2.6M runs, clean);
+  - `procctl-gen` with C and Go golden vectors.
+- **Benchmarks (`make bench`):**
+
+  | | amd64 (i7-1370P) | arm64 (GB10) |
+  |---|---|---|
+  | no-change `poll()` | 0.6 ns | 1.6 ns |
+  | 5 µs launch proxy delta | ~0 ns | ~1.4 ns |
+
+  The new hardware CRC32C (SSE4.2 / ARMv8, chosen at runtime) took a 4 KiB config read from 8.7 µs to about 1 µs.
+- **CI:** `.github/workflows/ci.yml` (amd64 + arm64: compile matrix, C tests, Go tests with a 60 s stress run, benchmarks, short fuzzing) and `nightly.yml` (15-minute stress, long model test, long fuzzing; opens an issue on failure).
+- **Deviations:**
+  - schemas are JSON, not YAML (no dependency);
+  - the "cgo offset checks" are a C layout dump compared in Go, because Go forbids cgo in `_test.go` files;
+  - golden vectors cover the generated consumer schemas; the core wire format is covered by the layout check, parser tests and live interop.
+
 - **C side:** `grant_get`, `resource_report`, `grant_usable`, and the reference holder loop in `examples/token`.
 - **Go side:** `exclusive.Arbiter` with RoundRobin, renewal-by-transfer, adoption and blocked reporting.
 - **Tests:** arbiter model tests (§8.4), golden vectors, interop, stress, fuzzing, benchmarks, offset checks, static checks.

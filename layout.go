@@ -5,10 +5,13 @@
 package procctl
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"sync/atomic"
+	"unsafe"
 )
 
 // Spec version implemented by this package.
@@ -17,85 +20,130 @@ const (
 	SpecMinor = 0
 )
 
-// Layout sizes and limits (SPEC §4–§6).
+// Limits (SPEC §4, §10.2).
 const (
-	HeaderSize       = 128
-	CtrlSize         = 64
-	EntrySize        = 48
-	StateHdrSize     = 64
 	MaxSlots         = 64
 	MaxStateSize     = 65536
 	DefaultMaxRegion = 4 << 20
-	signature        = "PROC_CTL"
-	stateMagic       = "PROCSTAT"
-	memfdPrefix      = "/memfd:procctl:"
 )
 
-// Header field offsets.
+// ---- Wire structs -------------------------------------------------------------
+//
+// These mirror SPEC §4–§6 field for field. All layout sizes and offsets are
+// derived from them; the assertions below pin each one to the size the spec
+// gives, and TestLayoutMatchesC checks every field offset against procctl.h.
+// Encoding is little-endian; the agent runs only on little-endian hosts.
+
+// wireHeader is the region header (SPEC §4).
+type wireHeader struct {
+	Signature     [8]byte
+	SpecMajor     uint16
+	SpecMinor     uint16
+	HeaderSize    uint32
+	TotalSize     uint64
+	PageSize      uint32
+	Flags         uint32
+	Consumer      [32]byte
+	SchemaVersion uint32
+	CreatorPID    uint32
+	AgentAreaOff  uint64
+	AgentAreaSize uint64
+	StateAddr     uint64
+	StateSize     uint32
+	ResourceSlots uint16
+	_             uint16
+	CreatedAtNS   uint64
+	InstanceID    uint64
+	HeaderCRC     uint32
+	_             uint32
+}
+
+// ctrlBlock is the agent area's control block (SPEC §5.1). The agent
+// accesses it in place, through atomics, overlaid on the shared mapping.
+type ctrlBlock struct {
+	Seq          atomic.Uint64
+	PayloadLen   atomic.Uint32
+	Flags        atomic.Uint32
+	WriterID     atomic.Uint64
+	HeartbeatNS  atomic.Uint64
+	LeaseNS      atomic.Uint64
+	WriterPID    atomic.Uint32
+	WriterFlags  atomic.Uint32
+	WriterStart  atomic.Uint64
+	PayloadCRC32 atomic.Uint32
+	_            uint32
+}
+
+// Grant is one grant-table entry (SPEC §5.2).
+type Grant struct {
+	ID       [16]byte
+	GrantID  uint64 // 0 on Write means "new grant": it gets the write's generation (§9.3)
+	Duration uint64 // nanoseconds
+	Kind     uint32
+	_        uint32 // flags, reserved
+	_        uint64
+}
+
+// stateHeader is the fixed part of a state block (SPEC §6).
+type stateHeader struct {
+	Magic           [8]byte
+	Seq             uint64
+	InstanceID      uint64
+	WriterPID       uint32
+	StateLen        uint32
+	AppliedGen      uint64
+	AppliedWriterID uint64
+	GrantsSeenGen   uint64
+	CRC32           uint32
+	_               uint32
+}
+
+// ResourceEntry is one resource-table entry of a state block (SPEC §6.1).
+type ResourceEntry struct {
+	ID             [16]byte
+	GrantID        uint64
+	LastActivityNS uint64
+	Kind           uint32
+	State          uint32
+	Flags          uint32
+	Error          uint32
+}
+
+// Sizes, derived from the structs.
 const (
-	hSig       = 0
-	hMajor     = 8
-	hMinor     = 10
-	hHdrSize   = 12
-	hTotal     = 16
-	hPage      = 24
-	hFlags     = 28
-	hConsumer  = 32
-	hSchema    = 64
-	hCreator   = 68
-	hAreaOff   = 72
-	hAreaSize  = 80
-	hStateAddr = 88
-	hStateSize = 96
-	hSlots     = 100
-	hCreated   = 104
-	hInstance  = 112
-	hCRC       = 120
+	HeaderSize   = int(unsafe.Sizeof(wireHeader{}))
+	CtrlSize     = int(unsafe.Sizeof(ctrlBlock{}))
+	EntrySize    = int(unsafe.Sizeof(Grant{}))
+	StateHdrSize = int(unsafe.Sizeof(stateHeader{}))
+	resEntrySize = int(unsafe.Sizeof(ResourceEntry{}))
+	headerCRCOff = int(unsafe.Offsetof(wireHeader{}.HeaderCRC))
+	stateSeqOff  = int(unsafe.Offsetof(stateHeader{}.Seq))
+	stateCRCOff  = int(unsafe.Offsetof(stateHeader{}.CRC32))
 )
 
-// Control block offsets (SPEC §5.1).
-const (
-	cSeq         = 0
-	cLen         = 8
-	cFlags       = 12
-	cWriterID    = 16
-	cHeartbeat   = 24
-	cLease       = 32
-	cWriterPID   = 40
-	cWriterFlags = 44
-	cWriterStart = 48
-	cCRC         = 56
+// Compile-time checks that the structs have exactly the spec's sizes (a
+// negative array length fails the build) and that both entry kinds agree.
+var (
+	_ [HeaderSize - 128]struct{}
+	_ [128 - HeaderSize]struct{}
+	_ [CtrlSize - 64]struct{}
+	_ [64 - CtrlSize]struct{}
+	_ [EntrySize - 48]struct{}
+	_ [48 - EntrySize]struct{}
+	_ [resEntrySize - EntrySize]struct{}
+	_ [EntrySize - resEntrySize]struct{}
+	_ [StateHdrSize - 64]struct{}
+	_ [64 - StateHdrSize]struct{}
 )
 
-// Control block flag bits.
 const (
+	signature   = "PROC_CTL"
+	stateMagic  = "PROCSTAT"
+	memfdPrefix = "/memfd:procctl:"
+
+	// Control block flags (SPEC §5.1).
 	FlagPayloadValid = 1 << 0
 	writerReleased   = 1 << 0
-)
-
-// State block offsets (SPEC §6).
-const (
-	sMagic    = 0
-	sSeq      = 8
-	sInstance = 16
-	sPID      = 24
-	sLen      = 28
-	sApplied  = 32
-	sAppliedW = 40
-	sSeen     = 48
-	sCRC      = 56
-)
-
-// Entry offsets: grant table (§5.2) and resource table (§6.1).
-const (
-	eID       = 0
-	eGrant    = 16
-	eDuration = 24
-	eActivity = 24
-	eKind     = 32
-	eState    = 36
-	eFlags    = 40
-	eError    = 44
 )
 
 var castagnoli = crc32.MakeTable(crc32.Castagnoli)
@@ -103,6 +151,23 @@ var castagnoli = crc32.MakeTable(crc32.Castagnoli)
 func crc32c(b []byte) uint32 { return crc32.Checksum(b, castagnoli) }
 
 var le = binary.LittleEndian
+
+// decode reads a fixed-size wire struct from the front of b.
+func decode[T any](b []byte, v *T) error {
+	return binary.Read(bytes.NewReader(b), le, v)
+}
+
+// encode appends a wire struct (or slice of them) to dst.
+func encode(dst *bytes.Buffer, v any) {
+	if err := binary.Write(dst, le, v); err != nil {
+		panic(err) // only fixed-size wire structs are encoded
+	}
+}
+
+func isLittleEndian() bool {
+	x := uint16(1)
+	return *(*byte)(unsafe.Pointer(&x)) == 1
+}
 
 // Header is a validated snapshot of a region header. Agents use only the
 // snapshot after attach (SPEC §10.2 step 7).
@@ -131,50 +196,43 @@ func invalid(format string, a ...any) error {
 // ParseHeader validates a header copied out of a region of size fileSize.
 func ParseHeader(b []byte, fileSize uint64) (Header, error) {
 	var h Header
-	if len(b) < HeaderSize {
+	var w wireHeader
+	if len(b) < HeaderSize || decode(b, &w) != nil {
 		return h, invalid("short header")
 	}
-	if string(b[hSig:hSig+8]) != signature {
+	if string(w.Signature[:]) != signature {
 		return h, invalid("bad signature")
 	}
-	if crc32c(b[:hCRC]) != le.Uint32(b[hCRC:]) {
+	if crc32c(b[:headerCRCOff]) != w.HeaderCRC {
 		return h, invalid("header crc mismatch")
 	}
-	h.SpecMajor = le.Uint16(b[hMajor:])
-	h.SpecMinor = le.Uint16(b[hMinor:])
-	if h.SpecMajor != SpecMajor {
-		return h, invalid("spec major %d not supported", h.SpecMajor)
+	if w.SpecMajor != SpecMajor {
+		return h, invalid("spec major %d not supported", w.SpecMajor)
 	}
-	h.TotalSize = le.Uint64(b[hTotal:])
-	h.PageSize = le.Uint32(b[hPage:])
-	h.SchemaVersion = le.Uint32(b[hSchema:])
-	h.CreatorPID = le.Uint32(b[hCreator:])
-	h.AreaOff = le.Uint64(b[hAreaOff:])
-	h.AreaSize = le.Uint64(b[hAreaSize:])
-	h.StateAddr = le.Uint64(b[hStateAddr:])
-	h.StateSize = le.Uint32(b[hStateSize:])
-	h.ResourceSlots = le.Uint16(b[hSlots:])
-	h.CreatedAtNS = le.Uint64(b[hCreated:])
-	h.InstanceID = le.Uint64(b[hInstance:])
-
-	name := b[hConsumer : hConsumer+32]
-	n := 0
-	for n < len(name) && name[n] != 0 {
-		c := name[n]
+	n := bytes.IndexByte(w.Consumer[:], 0)
+	if n < 0 {
+		n = len(w.Consumer)
+	}
+	for _, c := range w.Consumer[:n] {
 		if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '_') {
 			return h, invalid("bad consumer name")
 		}
-		n++
 	}
 	if n == 0 || n > 31 {
 		return h, invalid("bad consumer name length")
 	}
-	for _, c := range name[n:] {
+	for _, c := range w.Consumer[n:] {
 		if c != 0 {
 			return h, invalid("consumer not NUL-padded")
 		}
 	}
-	h.Consumer = string(name[:n])
+	h = Header{
+		SpecMajor: w.SpecMajor, SpecMinor: w.SpecMinor, TotalSize: w.TotalSize,
+		PageSize: w.PageSize, Consumer: string(w.Consumer[:n]), SchemaVersion: w.SchemaVersion,
+		CreatorPID: w.CreatorPID, AreaOff: w.AgentAreaOff, AreaSize: w.AgentAreaSize,
+		StateAddr: w.StateAddr, StateSize: w.StateSize, ResourceSlots: w.ResourceSlots,
+		CreatedAtNS: w.CreatedAtNS, InstanceID: w.InstanceID,
+	}
 
 	p := uint64(h.PageSize)
 	switch {
@@ -190,7 +248,7 @@ func ParseHeader(b []byte, fileSize uint64) (Header, error) {
 		return h, invalid("areas do not cover the region")
 	case h.ResourceSlots > MaxSlots:
 		return h, invalid("too many resource slots %d", h.ResourceSlots)
-	case CtrlSize+uint64(h.ResourceSlots)*EntrySize > h.AreaSize:
+	case uint64(CtrlSize)+uint64(h.ResourceSlots)*uint64(EntrySize) > h.AreaSize:
 		return h, invalid("grant table does not fit")
 	case h.InstanceID == 0:
 		return h, invalid("zero instance_id")
@@ -199,9 +257,9 @@ func ParseHeader(b []byte, fileSize uint64) (Header, error) {
 		switch {
 		case h.StateAddr%8 != 0:
 			return h, invalid("state_addr not aligned")
-		case h.StateSize%8 != 0 || h.StateSize < StateHdrSize || h.StateSize > MaxStateSize:
+		case h.StateSize%8 != 0 || h.StateSize < uint32(StateHdrSize) || h.StateSize > MaxStateSize:
 			return h, invalid("bad state_size %d", h.StateSize)
-		case StateHdrSize+uint32(h.ResourceSlots)*EntrySize > h.StateSize:
+		case uint32(StateHdrSize)+uint32(h.ResourceSlots)*uint32(resEntrySize) > h.StateSize:
 			return h, invalid("resource table does not fit the state block")
 		}
 	} else if h.StateSize != 0 {
@@ -217,23 +275,18 @@ func (h *Header) PayloadCapacity() int {
 
 // encodeHeader builds a header; used by tests and tools that create regions.
 func encodeHeader(h Header) []byte {
-	b := make([]byte, HeaderSize)
-	copy(b[hSig:], signature)
-	le.PutUint16(b[hMajor:], h.SpecMajor)
-	le.PutUint16(b[hMinor:], h.SpecMinor)
-	le.PutUint32(b[hHdrSize:], HeaderSize)
-	le.PutUint64(b[hTotal:], h.TotalSize)
-	le.PutUint32(b[hPage:], h.PageSize)
-	copy(b[hConsumer:hConsumer+31], h.Consumer)
-	le.PutUint32(b[hSchema:], h.SchemaVersion)
-	le.PutUint32(b[hCreator:], h.CreatorPID)
-	le.PutUint64(b[hAreaOff:], h.AreaOff)
-	le.PutUint64(b[hAreaSize:], h.AreaSize)
-	le.PutUint64(b[hStateAddr:], h.StateAddr)
-	le.PutUint32(b[hStateSize:], h.StateSize)
-	le.PutUint16(b[hSlots:], h.ResourceSlots)
-	le.PutUint64(b[hCreated:], h.CreatedAtNS)
-	le.PutUint64(b[hInstance:], h.InstanceID)
-	le.PutUint32(b[hCRC:], crc32c(b[:hCRC]))
+	w := wireHeader{
+		SpecMajor: h.SpecMajor, SpecMinor: h.SpecMinor, HeaderSize: uint32(HeaderSize),
+		TotalSize: h.TotalSize, PageSize: h.PageSize, SchemaVersion: h.SchemaVersion,
+		CreatorPID: h.CreatorPID, AgentAreaOff: h.AreaOff, AgentAreaSize: h.AreaSize,
+		StateAddr: h.StateAddr, StateSize: h.StateSize, ResourceSlots: h.ResourceSlots,
+		CreatedAtNS: h.CreatedAtNS, InstanceID: h.InstanceID,
+	}
+	copy(w.Signature[:], signature)
+	copy(w.Consumer[:31], h.Consumer)
+	var buf bytes.Buffer
+	encode(&buf, &w)
+	b := buf.Bytes()
+	le.PutUint32(b[headerCRCOff:], crc32c(b[:headerCRCOff]))
 	return b
 }

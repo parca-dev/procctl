@@ -3,7 +3,10 @@ CFLAGS ?= -O1 -g -Wall -Wextra -Werror
 BIN    := bin
 SAN    := -fsanitize=address,undefined -fno-sanitize-recover=all
 
-.PHONY: all test test-c test-c-compile test-go demo clean
+generate:
+	go run ./cmd/procctl-gen -schema schemas/testproto.procctl.json -c-out c/gen -go-out internal/testproto -go-package testproto -vectors testdata/vectors
+
+.PHONY: generate all test test-c test-c-compile test-go bench fuzz-go fuzz-c model-long kernel-report demo clean
 
 all: $(BIN)/echo-client $(BIN)/echo-agent
 
@@ -30,10 +33,38 @@ test-c-compile:
 test-c: | $(BIN)
 	$(CC) -std=c11 $(CFLAGS) $(SAN) -o $(BIN)/unit_test c/tests/unit_test.c -lpthread
 	$(BIN)/unit_test
+	$(CC) -std=c11 $(CFLAGS) -o $(BIN)/vectors_test c/tests/vectors_test.c
+	$(BIN)/vectors_test testdata/vectors
+	g++ -std=c++17 -Wall -Wextra -Werror -x c++ -fsyntax-only c/gen/testproto_schema.h
 
 test-go:
 	go vet ./...
 	go test -race -count=1 ./...
+
+# poll() microbenchmarks. PROCCTL_BENCH_ENFORCE=1 fails if the no-change path is >= 2 ns.
+bench: | $(BIN)
+	$(CC) -std=gnu11 -O2 -Ic -o $(BIN)/bench_poll c/tests/bench_poll.c
+	$(BIN)/bench_poll
+
+FUZZTIME ?= 30s
+fuzz-go:
+	@for f in FuzzParseHeader FuzzParseState FuzzAreaRead; do \
+	  go test -run '^$$' -fuzz "^$$f$$" -fuzztime $(FUZZTIME) . || exit 1; done
+
+FUZZSECS ?= 30
+fuzz-c: | $(BIN)
+	clang -std=gnu11 -g -O1 -fsanitize=fuzzer,address,undefined -o $(BIN)/fuzz_area c/tests/fuzz_area.c
+	$(BIN)/fuzz_area -max_total_time=$(FUZZSECS) -print_final_stats=1
+
+# Arbiter model tests: 5000 random schedules x 10000 steps.
+model-long:
+	go test -count=1 -timeout 2h -run TestModel ./exclusive -args -long
+
+kernel-report:
+	@uname -a; echo "page size: $$(getconf PAGESIZE)"; \
+	echo "yama ptrace_scope: $$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo n/a)"; \
+	echo "perf_event_paranoid: $$(cat /proc/sys/kernel/perf_event_paranoid)"; \
+	echo "unprivileged_userfaultfd: $$(cat /proc/sys/vm/unprivileged_userfaultfd 2>/dev/null || echo n/a)"
 
 demo: all
 	examples/echo/demo.sh

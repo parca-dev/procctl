@@ -80,6 +80,7 @@ type Client struct {
 
 	// Last publication, for republish on CRC drift (SPEC §7.4).
 	pubValid   bool
+	pubGen     uint64
 	pubPayload []byte
 	pubGrants  []Grant
 	pubFlags   uint32
@@ -254,7 +255,7 @@ func (c *Client) markDone() { c.doneOnce.Do(func() { close(c.done) }) }
 func (c *Client) Owned() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.owned && c.area.u64(cWriterID).Load() == c.opt.Identity.WriterID
+	return c.owned && c.area.cb().WriterID.Load() == c.opt.Identity.WriterID
 }
 
 // claimLocked tries to become the owner (SPEC §8.1).
@@ -263,37 +264,55 @@ func (c *Client) claimLocked(now time.Time) bool {
 		return false
 	}
 	id := c.opt.Identity
-	w := c.area.u64(cWriterID).Load()
+	w := c.area.cb().WriterID.Load()
 	if w == id.WriterID {
 		c.owned = true
 		return true
 	}
-	hb := c.area.u64(cHeartbeat).Load()
+	hb := c.area.cb().HeartbeatNS.Load()
 	if hb != c.hbSeen || c.hbSeenAt.IsZero() {
 		c.hbSeen, c.hbSeenAt = hb, now
 	}
 	may := w == 0 ||
-		c.area.u32(cWriterFlags).Load()&writerReleased != 0 ||
+		c.area.cb().WriterFlags.Load()&writerReleased != 0 ||
 		c.ownerGone() ||
-		(c.area.u64(cLease).Load() != 0 &&
-			now.Sub(c.hbSeenAt) > time.Duration(c.area.u64(cLease).Load()))
-	if !may || !c.area.u64(cWriterID).CompareAndSwap(w, id.WriterID) {
+		(c.area.cb().LeaseNS.Load() != 0 &&
+			now.Sub(c.hbSeenAt) > time.Duration(c.area.cb().LeaseNS.Load()))
+	if !may || !c.area.cb().WriterID.CompareAndSwap(w, id.WriterID) {
 		c.owned = false
 		return false
 	}
-	c.area.u32(cWriterPID).Store(id.PID)
-	c.area.u64(cWriterStart).Store(id.Start)
-	c.area.u32(cWriterFlags).Store(0)
-	c.area.u64(cLease).Store(uint64(c.opt.Lease))
+	c.area.cb().WriterPID.Store(id.PID)
+	c.area.cb().WriterStart.Store(id.Start)
+	c.area.cb().WriterFlags.Store(0)
+	c.area.cb().LeaseNS.Store(uint64(c.opt.Lease))
 	c.heartbeatLocked()
 	c.owned = true
+	c.adoptLocked()
 	return true
+}
+
+// adoptLocked takes the region's current payload and grant table as this
+// owner's publication, so later writes keep them (SPEC §9.2 A4) and drift
+// checks compare against them.
+func (c *Client) adoptLocked() {
+	gen, payload, grants, err := c.area.readPayload()
+	if err != nil || gen == 0 {
+		return
+	}
+	c.pubValid = true
+	c.pubGen = gen
+	c.pubFlags = c.area.cb().Flags.Load()
+	c.pubPayload = append([]byte(nil), payload...)
+	c.pubGrants = grants
+	c.pubLen = c.area.cb().PayloadLen.Load()
+	c.pubCRC = c.area.cb().PayloadCRC32.Load()
 }
 
 // ownerGone: claim rule 3. Only meaningful when agents share a pid namespace.
 func (c *Client) ownerGone() bool {
-	pid := c.area.u32(cWriterPID).Load()
-	want := c.area.u64(cWriterStart).Load()
+	pid := c.area.cb().WriterPID.Load()
+	want := c.area.cb().WriterStart.Load()
 	if pid == 0 {
 		return false
 	}
@@ -306,11 +325,11 @@ func (c *Client) ownerGone() bool {
 
 func (c *Client) heartbeatLocked() {
 	now := uint64(bootNow())
-	prev := c.area.u64(cHeartbeat).Load()
+	prev := c.area.cb().HeartbeatNS.Load()
 	if now <= prev {
 		now = prev + 1
 	}
-	c.area.u64(cHeartbeat).Store(now)
+	c.area.cb().HeartbeatNS.Store(now)
 }
 
 // Write publishes a consumer payload and grant table as one generation.
@@ -319,18 +338,46 @@ func (c *Client) heartbeatLocked() {
 func (c *Client) Write(payload []byte, grants []Grant) (uint64, []Grant, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.writeLocked(payload, payload != nil, grants)
+}
+
+// WritePayload publishes a new consumer payload and keeps the current grants.
+func (c *Client) WritePayload(payload []byte) (uint64, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	gen, _, err := c.writeLocked(payload, payload != nil, c.pubGrants)
+	return gen, err
+}
+
+// WriteGrants publishes a new grant table and keeps the current payload.
+// Grants with GrantID 0 are new and receive the returned generation.
+func (c *Client) WriteGrants(grants []Grant) (uint64, []Grant, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.writeLocked(c.pubPayload, c.pubFlags&FlagPayloadValid != 0, grants)
+}
+
+// Grants returns the grant table this agent last published (or adopted),
+// and that publication's generation.
+func (c *Client) Grants() ([]Grant, uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]Grant(nil), c.pubGrants...), c.pubGen
+}
+
+func (c *Client) writeLocked(payload []byte, valid bool, grants []Grant) (uint64, []Grant, error) {
 	if c.closed {
 		return 0, nil, ErrClosed
 	}
 	if !c.owned && !c.claimLocked(time.Now()) {
 		return 0, nil, ErrNotOwner
 	}
-	if c.area.u64(cWriterID).Load() != c.opt.Identity.WriterID {
+	if c.area.cb().WriterID.Load() != c.opt.Identity.WriterID {
 		c.owned = false
 		return 0, nil, ErrPreempted
 	}
 	var flags uint32
-	if payload != nil {
+	if valid {
 		flags = FlagPayloadValid
 	}
 	gen, out, err := c.area.write(payload, grants, flags)
@@ -341,11 +388,12 @@ func (c *Client) Write(payload []byte, grants []Grant) (uint64, []Grant, error) 
 		return 0, nil, err
 	}
 	c.pubValid = true
-	c.pubPayload = append(c.pubPayload[:0], payload...)
-	c.pubGrants = append(c.pubGrants[:0], out...)
+	c.pubGen = gen
+	c.pubPayload = append([]byte(nil), payload...)
+	c.pubGrants = out
 	c.pubFlags = flags
-	c.pubLen = c.area.u32(cLen).Load()
-	c.pubCRC = c.area.u32(cCRC).Load()
+	c.pubLen = c.area.cb().PayloadLen.Load()
+	c.pubCRC = c.area.cb().PayloadCRC32.Load()
 	return gen, out, nil
 }
 
@@ -363,15 +411,16 @@ func (c *Client) Heartbeat() error {
 		}
 		return nil
 	}
-	if c.area.u64(cWriterID).Load() != c.opt.Identity.WriterID {
+	if c.area.cb().WriterID.Load() != c.opt.Identity.WriterID {
 		c.owned = false
 		return ErrPreempted
 	}
 	c.heartbeatLocked()
-	if c.pubValid && (c.area.u32(cLen).Load() != c.pubLen || c.area.u32(cCRC).Load() != c.pubCRC) {
-		if _, _, err := c.area.write(c.pubPayload, c.pubGrants, c.pubFlags); err == nil {
-			c.pubLen = c.area.u32(cLen).Load()
-			c.pubCRC = c.area.u32(cCRC).Load()
+	if c.pubValid && (c.area.cb().PayloadLen.Load() != c.pubLen || c.area.cb().PayloadCRC32.Load() != c.pubCRC) {
+		if gen, _, err := c.area.write(c.pubPayload, c.pubGrants, c.pubFlags); err == nil {
+			c.pubGen = gen
+			c.pubLen = c.area.cb().PayloadLen.Load()
+			c.pubCRC = c.area.cb().PayloadCRC32.Load()
 		}
 	}
 	return nil
@@ -420,9 +469,9 @@ func (c *Client) release(clear bool) {
 		return
 	}
 	if clear {
-		c.area.u64(cWriterID).CompareAndSwap(c.opt.Identity.WriterID, 0)
-	} else if c.area.u64(cWriterID).Load() == c.opt.Identity.WriterID {
-		c.area.u32(cWriterFlags).Store(writerReleased)
+		c.area.cb().WriterID.CompareAndSwap(c.opt.Identity.WriterID, 0)
+	} else if c.area.cb().WriterID.Load() == c.opt.Identity.WriterID {
+		c.area.cb().WriterFlags.Store(writerReleased)
 	}
 	c.owned = false
 }

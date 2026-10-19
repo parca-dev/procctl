@@ -53,10 +53,9 @@ static void agent_open(struct agent *a, procctl_t *ctx) {
   a->map = mmap(NULL, a->size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
   CHECK(a->map != MAP_FAILED);
   close(fd);
-  uint64_t off;
-  memcpy(&off, a->map + 72, 8);
-  a->area = a->map + off;
-  memcpy(&a->slots, a->map + 100, 2);
+  const struct procctl_wire_header *h = (const struct procctl_wire_header *)(const void *)a->map;
+  a->area = a->map + h->agent_area_off;
+  a->slots = h->resource_slots;
 }
 
 struct grant { uint32_t kind; uint8_t id[16]; uint64_t grant_id, duration; };
@@ -64,52 +63,52 @@ struct grant { uint32_t kind; uint8_t id[16]; uint64_t grant_id, duration; };
 /* Seqlock writer per SPEC §7.1 (single-threaded test: no CAS needed). */
 static uint64_t agent_write(struct agent *a, const void *payload, uint32_t len, uint32_t flags,
                             const struct grant *g, int ng) {
-  uint64_t *seq = (uint64_t *)(void *)a->area;
-  uint64_t s = __atomic_load_n(seq, __ATOMIC_ACQUIRE);
+  struct procctl_ctrl *cb = (struct procctl_ctrl *)(void *)a->area;
+  uint64_t s = __atomic_load_n(&cb->seq, __ATOMIC_ACQUIRE);
   uint64_t t = (s & 1) ? s + 2 : s + 1;
-  __atomic_store_n(seq, t, __ATOMIC_RELAXED);
+  __atomic_store_n(&cb->seq, t, __ATOMIC_RELAXED);
   __atomic_thread_fence(__ATOMIC_RELEASE);
-  size_t gt = (size_t)a->slots * 48;
-  uint8_t *body = a->area + 64;
-  memset(body, 0, gt);
+  struct procctl_grant_entry *table = (struct procctl_grant_entry *)(void *)(cb + 1);
+  size_t gt = (size_t)a->slots * sizeof *table;
+  memset(table, 0, gt);
   for (int i = 0; i < ng; i++) {
-    uint8_t *e = body + (size_t)i * 48;
-    uint64_t gid = g[i].grant_id ? g[i].grant_id : t + 1;
-    memcpy(e, g[i].id, 16);
-    memcpy(e + 16, &gid, 8);
-    memcpy(e + 24, &g[i].duration, 8);
-    memcpy(e + 32, &g[i].kind, 4);
+    memcpy(table[i].resource_id, g[i].id, 16);
+    table[i].grant_id = g[i].grant_id ? g[i].grant_id : t + 1;
+    table[i].duration_ns = g[i].duration;
+    table[i].kind = g[i].kind;
   }
+  uint8_t *body = (uint8_t *)table;
   memcpy(body + gt, payload, len);
-  uint32_t crc = procctl__crc32c(body, gt + len);
-  memcpy(a->area + 8, &len, 4);
-  memcpy(a->area + 12, &flags, 4);
-  memcpy(a->area + 56, &crc, 4);
-  __atomic_store_n(seq, t + 1, __ATOMIC_RELEASE);
-  syscall(SYS_futex, (uint32_t *)(void *)seq, FUTEX_WAKE, INT32_MAX, NULL, NULL, 0);
+  cb->payload_crc32c = procctl__crc32c(body, gt + len);
+  cb->payload_len = len;
+  cb->flags = flags;
+  __atomic_store_n(&cb->seq, t + 1, __ATOMIC_RELEASE);
+  syscall(SYS_futex, (uint32_t *)(void *)&cb->seq, FUTEX_WAKE, INT32_MAX, NULL, NULL, 0);
   return t + 1;
 }
 
 static void agent_set(struct agent *a, uint64_t writer, uint64_t hb, uint64_t lease) {
-  memcpy(a->area + 16, &writer, 8);
-  memcpy(a->area + 24, &hb, 8);
-  memcpy(a->area + 32, &lease, 8);
+  struct procctl_ctrl *cb = (struct procctl_ctrl *)(void *)a->area;
+  cb->writer_id = writer;
+  cb->heartbeat_ns = hb;
+  cb->lease_ns = lease;
 }
 
 /* ---- state block checks ---------------------------------------------------- */
 
-static uint64_t ld64(const uint8_t *p) { uint64_t v; memcpy(&v, p, 8); return v; }
-static uint32_t ld32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
+#define SH ((const struct procctl_state_hdr *)(const void *)g_storage)
+#define RES ((const struct procctl_res_entry *)(const void *)(g_storage + sizeof(struct procctl_state_hdr)))
 
 static void check_state_consistent(void) {
-  CHECK(memcmp(g_storage, "PROCSTAT", 8) == 0);
-  CHECK((ld64(g_storage + 8) & 1) == 0);
-  uint32_t used = 64 + SLOTS * 48 + ld32(g_storage + 28);
+  CHECK(memcmp(SH->magic, "PROCSTAT", 8) == 0);
+  CHECK((SH->seq & 1) == 0);
+  size_t used = sizeof *SH + SLOTS * sizeof *RES + SH->state_len;
   uint8_t copy[sizeof g_storage];
   memcpy(copy, g_storage, used);
-  uint32_t want = ld32(copy + 56);
-  memset(copy + 8, 0, 8);  /* seq */
-  memset(copy + 56, 0, 4); /* crc32c */
+  struct procctl_state_hdr *ch = (struct procctl_state_hdr *)(void *)copy;
+  uint32_t want = ch->crc32c;
+  ch->seq = 0;
+  ch->crc32c = 0;
   CHECK(procctl__crc32c(copy, used) == want);
 }
 
@@ -134,12 +133,12 @@ static void test_init_and_header(void) {
         (F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL));
   CHECK(!(seals & F_SEAL_WRITE));
 
-  const uint8_t *h = c->map;
-  CHECK(memcmp(h, "PROC_CTL", 8) == 0);
-  CHECK(procctl__crc32c(h, 120) == ld32(h + 120));
-  CHECK(ld64(h + 88) == (uint64_t)(uintptr_t)g_storage);
-  CHECK(ld32(h + 96) == PROCCTL_STATE_BLOCK_SIZE(SLOTS, STATE_CAP));
-  CHECK(ld64(h + 112) == ld64(g_storage + 16)); /* instance ids match */
+  const struct procctl_wire_header *h = (const struct procctl_wire_header *)(const void *)c->map;
+  CHECK(memcmp(h->signature, "PROC_CTL", 8) == 0);
+  CHECK(procctl__crc32c(h, offsetof(struct procctl_wire_header, header_crc32c)) == h->header_crc32c);
+  CHECK(h->state_addr == (uint64_t)(uintptr_t)g_storage);
+  CHECK(h->state_size == PROCCTL_STATE_BLOCK_SIZE(SLOTS, STATE_CAP));
+  CHECK(h->instance_id == SH->instance_id);
   check_state_consistent();
 
   /* Bad configs. */
@@ -171,10 +170,10 @@ static void test_poll_ack_lease(struct agent *a) {
   CHECK(procctl_poll(&g_ctx, buf, sizeof buf, &gen) == 0); /* consumed */
 
   CHECK(procctl_ack(&g_ctx, g1, 0) == 0);
-  CHECK(ld64(g_storage + 32) == g1);
-  CHECK(ld64(g_storage + 40) == 0xabc);
+  CHECK(SH->applied_gen == g1);
+  CHECK(SH->applied_writer_id == 0xabc);
   CHECK(procctl_ack(&g_ctx, g1 - 2, 0) == 0);
-  CHECK(ld64(g_storage + 32) == g1); /* never decreases */
+  CHECK(SH->applied_gen == g1); /* never decreases */
   check_state_consistent();
 
   /* Too small a buffer consumes the generation. */
@@ -197,7 +196,7 @@ static void test_poll_ack_lease(struct agent *a) {
 
   /* Torn payload (CRC mismatch) is rejected. */
   uint64_t g2 = agent_write(a, msg, (uint32_t)strlen(msg), 1, NULL, 0);
-  a->area[64 + SLOTS * 48] ^= 0xff;
+  a->area[sizeof(struct procctl_ctrl) + SLOTS * sizeof(struct procctl_grant_entry)] ^= 0xff;
   CHECK(procctl_poll(&g_ctx, buf, sizeof buf, &gen) == -EAGAIN);
   (void)g2;
   printf("ok poll_ack_lease\n");
@@ -224,15 +223,15 @@ static void test_grants(struct agent *a) {
 
   CHECK(procctl_resource_report(&g_ctx, 1, g.id, PROCCTL_RES_HOLDING, out.grant_id,
                                 PROCCTL_RES_F_WANT, 0, out.seen_gen, 0) == 0);
-  const uint8_t *e = g_storage + 64;
-  CHECK(memcmp(e, g.id, 16) == 0);
-  CHECK(ld64(e + 16) == out.grant_id && ld32(e + 32) == 1 && ld32(e + 36) == PROCCTL_RES_HOLDING);
-  CHECK(ld64(e + 24) != 0); /* activity stamped */
-  CHECK(ld64(g_storage + 48) == out.seen_gen);
+  const struct procctl_res_entry *e = &RES[0];
+  CHECK(memcmp(e->resource_id, g.id, 16) == 0);
+  CHECK(e->grant_id == out.grant_id && e->kind == 1 && e->state == PROCCTL_RES_HOLDING);
+  CHECK(e->last_activity_ns != 0); /* activity stamped */
+  CHECK(SH->grants_seen_gen == out.seen_gen);
   CHECK(procctl_resource_report(&g_ctx, 1, g.id, PROCCTL_RES_RELEASED, out.grant_id, 0, 0,
                                 out.seen_gen - 2, 0) == 0);
-  CHECK(ld64(g_storage + 48) == out.seen_gen); /* grants_seen_gen never decreases */
-  CHECK(ld32(e + 36) == PROCCTL_RES_RELEASED);
+  CHECK(SH->grants_seen_gen == out.seen_gen); /* never decreases */
+  CHECK(e->state == PROCCTL_RES_RELEASED);
   /* Fill all slots, then overflow. */
   for (int i = 1; i < SLOTS; i++) {
     uint8_t id[16];
@@ -245,7 +244,7 @@ static void test_grants(struct agent *a) {
   check_state_consistent();
 
   CHECK(procctl_state_set(&g_ctx, "status", 6, 0) == 0);
-  CHECK(ld32(g_storage + 28) == 6);
+  CHECK(SH->state_len == 6);
   CHECK(procctl_state_set(&g_ctx, g_storage, STATE_CAP + 1, 0) == -E2BIG);
   check_state_consistent();
   printf("ok grants\n");
@@ -292,7 +291,7 @@ static void test_fork(void) {
     if (c->fd == parent_fd && c->instance_id == parent_instance) _exit(14);
     if (c->instance_id == parent_instance) _exit(15);
     if (procctl_state_set(&g_ctx, "child", 5, 0) != 0) _exit(16);
-    if (ld32(g_storage + 24) != (uint32_t)getpid()) _exit(17);
+    if (SH->writer_pid != (uint32_t)getpid()) _exit(17);
     _exit(0);
   }
   int status = 0;
@@ -300,7 +299,7 @@ static void test_fork(void) {
   if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
     fprintf(stderr, "child exit status %d\n", WEXITSTATUS(status));
   CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
-  CHECK(ld32(g_storage + 24) == (uint32_t)getpid()); /* parent's block untouched */
+  CHECK(SH->writer_pid == (uint32_t)getpid()); /* parent's block untouched */
   printf("ok fork\n");
 }
 

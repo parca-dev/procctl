@@ -1,0 +1,51 @@
+name: nightly
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  long:
+    name: long (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Install clang
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang
+      - name: Stress (15 min)
+        env:
+          PROCCTL_STRESS_SECONDS: "900"
+        run: go test -count=1 -timeout 30m -run TestStress -v .
+      - name: Arbiter model tests (5000 schedules x 10000 steps)
+        run: make -s model-long
+      - name: Go fuzzing (10 min per target)
+        if: matrix.arch == 'amd64'
+        run: make -s fuzz-go FUZZTIME=10m
+      - name: C libFuzzer (30 min)
+        if: matrix.arch == 'amd64'
+        run: make -s fuzz-c FUZZSECS=1800
+      - name: Open an issue on failure
+        if: failure() && github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue create --repo "$GITHUB_REPOSITORY" \
+            --title "nightly failed (${{ matrix.arch }}): $(date -u +%F)" \
+            --body "See ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"

@@ -5,6 +5,7 @@ package procctl
 import (
 	"errors"
 	"testing"
+	"unsafe"
 )
 
 func validHeader() Header {
@@ -32,7 +33,7 @@ func TestParseHeaderRoundTrip(t *testing.T) {
 func TestParseHeaderRejects(t *testing.T) {
 	cases := map[string]func(h *Header, b []byte) []byte{
 		"bad signature":      func(h *Header, b []byte) []byte { b[0] = 'X'; return b },
-		"bad crc":            func(h *Header, b []byte) []byte { b[hSchema] ^= 1; return b },
+		"bad crc":            func(h *Header, b []byte) []byte { b[unsafe.Offsetof(wireHeader{}.SchemaVersion)] ^= 1; return b },
 		"major":              func(h *Header, b []byte) []byte { h.SpecMajor = 2; return nil },
 		"size mismatch":      func(h *Header, b []byte) []byte { h.TotalSize = 4096 * 3; return nil },
 		"page size":          func(h *Header, b []byte) []byte { h.PageSize = 1000; return nil },

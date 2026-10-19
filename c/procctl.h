@@ -38,11 +38,83 @@
 extern "C" {
 #endif
 
-/* Layout sizes (SPEC §4–§6). */
-#define PROCCTL_HEADER_SIZE 128u
-#define PROCCTL_CTRL_SIZE 64u
-#define PROCCTL_ENTRY_SIZE 48u
-#define PROCCTL_STATE_HDR_SIZE 64u
+/* Wire structs (SPEC §4–§6): little-endian, no implicit padding. Every size
+ * and offset is derived from these; the Go agent's structs are checked
+ * against them field by field (TestLayoutMatchesC). */
+
+struct procctl_wire_header { /* SPEC §4: page 0, written once by the process */
+  char signature[8];          /* "PROC_CTL", not NUL-terminated */
+  uint16_t spec_major;
+  uint16_t spec_minor;
+  uint32_t header_size;
+  uint64_t total_size;
+  uint32_t page_size;
+  uint32_t flags;
+  char consumer[32];          /* NUL-padded [a-z0-9_]{1,31} */
+  uint32_t schema_version;
+  uint32_t creator_pid;
+  uint64_t agent_area_off;
+  uint64_t agent_area_size;
+  uint64_t state_addr;        /* address of the state block in this process */
+  uint32_t state_size;
+  uint16_t resource_slots;
+  uint16_t reserved0;
+  uint64_t created_at_ns;
+  uint64_t instance_id;
+  uint32_t header_crc32c;     /* CRC32C of the bytes before this field */
+  uint32_t reserved1;
+};
+
+struct procctl_ctrl { /* SPEC §5.1: start of the agent area, written by the agent */
+  uint64_t seq;               /* seqlock; low 32 bits are the wake word */
+  uint32_t payload_len;
+  uint32_t flags;             /* bit 0: PAYLOAD_VALID */
+  uint64_t writer_id;
+  uint64_t heartbeat_ns;
+  uint64_t lease_ns;
+  uint32_t writer_pid;
+  uint32_t writer_flags;      /* bit 0: RELEASED */
+  uint64_t writer_start;
+  uint32_t payload_crc32c;
+  uint32_t reserved;
+};
+
+struct procctl_grant_entry { /* SPEC §5.2: follows the control block */
+  uint8_t resource_id[16];
+  uint64_t grant_id;          /* 0 = empty slot */
+  uint64_t duration_ns;
+  uint32_t kind;
+  uint32_t flags;
+  uint64_t reserved;
+};
+
+struct procctl_state_hdr { /* SPEC §6: in this process's own memory */
+  char magic[8];              /* "PROCSTAT" */
+  uint64_t seq;
+  uint64_t instance_id;
+  uint32_t writer_pid;
+  uint32_t state_len;
+  uint64_t applied_gen;
+  uint64_t applied_writer_id;
+  uint64_t grants_seen_gen;
+  uint32_t crc32c;            /* over the used block, seq and crc32c as zero */
+  uint32_t reserved;
+};
+
+struct procctl_res_entry { /* SPEC §6.1: follows the state header */
+  uint8_t resource_id[16];
+  uint64_t grant_id;
+  uint64_t last_activity_ns;
+  uint32_t kind;
+  uint32_t state;             /* PROCCTL_RES_* */
+  uint32_t flags;             /* PROCCTL_RES_F_WANT */
+  uint32_t error;
+};
+
+#define PROCCTL_HEADER_SIZE sizeof(struct procctl_wire_header)
+#define PROCCTL_CTRL_SIZE sizeof(struct procctl_ctrl)
+#define PROCCTL_ENTRY_SIZE sizeof(struct procctl_grant_entry)
+#define PROCCTL_STATE_HDR_SIZE sizeof(struct procctl_state_hdr)
 #define PROCCTL_MAX_SLOTS 64u
 #define PROCCTL_MAX_STATE_SIZE 65536u
 
@@ -56,7 +128,7 @@ extern "C" {
 
 /* procctl_config.flags */
 #define PROCCTL_F_NO_HELLO 1u
-#define PROCCTL_F_STATE_PROBE 2u
+#define PROCCTL_F_STATE_PROBE 2u /* fire procctl:state after state updates: debugging/tracing only (SPEC §11.2) */
 
 /* Lock flags for state writes. */
 #define PROCCTL_TRY 1 /* never wait for the state lock; return -EBUSY */
@@ -64,7 +136,7 @@ extern "C" {
 /* Bytes of state_storage needed: the published state block plus a private
  * tail used to time grants (16 bytes per slot). */
 #define PROCCTL_STATE_BLOCK_SIZE(slots, cap)                                   \
-  ((((size_t)PROCCTL_STATE_HDR_SIZE + (size_t)(slots)*PROCCTL_ENTRY_SIZE +     \
+  ((((size_t)PROCCTL_STATE_HDR_SIZE + (size_t)(slots)*sizeof(struct procctl_res_entry) + \
      (size_t)(cap)) + 7u) & ~(size_t)7u)
 #define PROCCTL_STATE_STORAGE(slots, cap)                                      \
   (PROCCTL_STATE_BLOCK_SIZE(slots, cap) + (size_t)(slots)*16u)
@@ -76,6 +148,13 @@ extern "C" {
 #define PROCCTL__ALIGNAS(n) _Alignas(n)
 #define PROCCTL__STATIC_ASSERT(c, m) _Static_assert(c, m)
 #endif
+
+/* The sizes SPEC.md gives. */
+PROCCTL__STATIC_ASSERT(sizeof(struct procctl_wire_header) == 128, "header size");
+PROCCTL__STATIC_ASSERT(sizeof(struct procctl_ctrl) == 64, "control block size");
+PROCCTL__STATIC_ASSERT(sizeof(struct procctl_grant_entry) == 48, "grant entry size");
+PROCCTL__STATIC_ASSERT(sizeof(struct procctl_res_entry) == 48, "resource entry size");
+PROCCTL__STATIC_ASSERT(sizeof(struct procctl_state_hdr) == 64, "state header size");
 
 typedef struct procctl {
   PROCCTL__ALIGNAS(64) unsigned char opaque[512];
@@ -111,6 +190,8 @@ static inline int procctl_poll(procctl_t *ctx, void *buf, size_t cap, uint64_t *
 PROCCTL_DEF int procctl_ack(procctl_t *ctx, uint64_t gen, int lflags);
 PROCCTL_DEF bool procctl_lease_expired(procctl_t *ctx, uint64_t now_ns);
 PROCCTL_DEF bool procctl_agent_attached(const procctl_t *ctx);
+/* Publishes the consumer state. Agents read it with a seqlock: don't call this
+ * in a tight loop, or their reads starve (SPEC §7.5); ~1 kHz at most. */
 PROCCTL_DEF int procctl_state_set(procctl_t *ctx, const void *state, size_t len, int lflags);
 
 PROCCTL_DEF int procctl_grant_get(procctl_t *ctx, uint32_t kind, const uint8_t id[16],
@@ -786,52 +867,6 @@ __extension__ extern unsigned long long __sdt_unsp;
 #define SYS_getrandom __NR_getrandom
 #endif
 
-/* Field offsets. */
-#define PC__H_SIG 0
-#define PC__H_MAJOR 8
-#define PC__H_MINOR 10
-#define PC__H_HSIZE 12
-#define PC__H_TOTAL 16
-#define PC__H_PAGE 24
-#define PC__H_CONSUMER 32
-#define PC__H_SCHEMA 64
-#define PC__H_CREATOR 68
-#define PC__H_AREA_OFF 72
-#define PC__H_AREA_SIZE 80
-#define PC__H_STATE_ADDR 88
-#define PC__H_STATE_SIZE 96
-#define PC__H_SLOTS 100
-#define PC__H_CREATED 104
-#define PC__H_INSTANCE 112
-#define PC__H_CRC 120
-
-#define PC__C_SEQ 0
-#define PC__C_LEN 8
-#define PC__C_FLAGS 12
-#define PC__C_WRITER 16
-#define PC__C_HB 24
-#define PC__C_LEASE 32
-#define PC__C_CRC 56
-
-#define PC__S_MAGIC 0
-#define PC__S_SEQ 8
-#define PC__S_INSTANCE 16
-#define PC__S_PID 24
-#define PC__S_LEN 28
-#define PC__S_APPLIED 32
-#define PC__S_APPLIED_W 40
-#define PC__S_SEEN 48
-#define PC__S_CRC 56
-
-#define PC__E_ID 0
-#define PC__E_GRANT 16
-#define PC__E_DUR 24       /* grant entry */
-#define PC__E_ACTIVITY 24  /* resource entry */
-#define PC__E_KIND 32
-#define PC__E_STATE 36
-#define PC__E_FLAGS 40
-#define PC__E_ERROR 44
-
 static const uint32_t procctl__crc_tab[256] = {
     0x00000000u, 0xf26b8303u, 0xe13b70f7u, 0x1350f3f4u, 0xc79a971fu, 0x35f1141cu,
     0x26a1e7e8u, 0xd4ca64ebu, 0x8ad958cfu, 0x78b2dbccu, 0x6be22838u, 0x9989ab3bu,
@@ -878,36 +913,65 @@ static const uint32_t procctl__crc_tab[256] = {
     0xbe2da0a5u, 0x4c4623a6u, 0x5f16d052u, 0xad7d5351u,
 };
 
-static uint32_t procctl__crc_update(uint32_t crc, const void *p, size_t n) {
-  const uint8_t *b = (const uint8_t *)p;
+static uint32_t pc__crc_sw(uint32_t crc, const uint8_t *b, size_t n) {
   while (n--) crc = procctl__crc_tab[(crc ^ *b++) & 0xffu] ^ (crc >> 8);
   return crc;
+}
+
+/* Hardware CRC32C (same reflected update as the table, no pre/post
+ * inversion), chosen at first use: no constructors. */
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+__attribute__((target("sse4.2"))) static uint32_t pc__crc_hw(uint32_t crc, const uint8_t *b,
+                                                            size_t n) {
+  uint64_t c = crc;
+  for (; n >= 8; b += 8, n -= 8) {
+    uint64_t v;
+    memcpy(&v, b, 8);
+    c = __builtin_ia32_crc32di(c, v);
+  }
+  crc = (uint32_t)c;
+  while (n--) crc = __builtin_ia32_crc32qi(crc, *b++);
+  return crc;
+}
+static int pc__crc_hw_ok(void) { return __builtin_cpu_supports("sse4.2"); }
+#define PROCCTL__HAVE_HWCRC 1
+#elif defined(__aarch64__) && (defined(__GNUC__) || defined(__clang__))
+#include <arm_acle.h>
+#include <sys/auxv.h>
+__attribute__((target("+crc"))) static uint32_t pc__crc_hw(uint32_t crc, const uint8_t *b,
+                                                          size_t n) {
+  for (; n >= 8; b += 8, n -= 8) {
+    uint64_t v;
+    memcpy(&v, b, 8);
+    crc = __crc32cd(crc, v);
+  }
+  while (n--) crc = __crc32cb(crc, *b++);
+  return crc;
+}
+static int pc__crc_hw_ok(void) { return (getauxval(AT_HWCAP) & (1ul << 7)) != 0; /* HWCAP_CRC32 */ }
+#define PROCCTL__HAVE_HWCRC 1
+#endif
+
+static uint32_t procctl__crc_update(uint32_t crc, const void *p, size_t n) {
+#ifdef PROCCTL__HAVE_HWCRC
+  static int mode; /* 0 = unknown, 1 = software, 2 = hardware; benign race */
+  int m = __atomic_load_n(&mode, __ATOMIC_RELAXED);
+  if (!m) {
+    m = pc__crc_hw_ok() ? 2 : 1;
+    __atomic_store_n(&mode, m, __ATOMIC_RELAXED);
+  }
+  if (m == 2) return pc__crc_hw(crc, (const uint8_t *)p, n);
+#endif
+  return pc__crc_sw(crc, (const uint8_t *)p, n);
 }
 static uint32_t procctl__crc32c(const void *p, size_t n) {
   return ~procctl__crc_update(~0u, p, n);
 }
 
-static inline uint64_t pc__ld64(const uint8_t *p) {
-  uint64_t v;
-  memcpy(&v, p, 8);
-  return v;
-}
-static inline uint32_t pc__ld32(const uint8_t *p) {
-  uint32_t v;
-  memcpy(&v, p, 4);
-  return v;
-}
-static inline void pc__st64(uint8_t *p, uint64_t v) { memcpy(p, &v, 8); }
-static inline void pc__st32(uint8_t *p, uint32_t v) { memcpy(p, &v, 4); }
-static inline void pc__st16(uint8_t *p, uint16_t v) { memcpy(p, &v, 2); }
-
-/* Atomic loads on the read-only mapping (8-byte aligned addresses). */
-static inline uint64_t pc__aload64(const uint8_t *p, int mo) {
-  return __atomic_load_n((const uint64_t *)(const void *)p, mo);
-}
-static inline uint32_t pc__aload32(const uint8_t *p, int mo) {
-  return __atomic_load_n((const uint32_t *)(const void *)p, mo);
-}
+#define PC__CTRL(c) ((const struct procctl_ctrl *)(const void *)(c)->area)
+#define PC__SH(c) ((struct procctl_state_hdr *)(void *)(c)->state)
+#define PC__RES(c) ((struct procctl_res_entry *)(void *)((c)->state + sizeof(struct procctl_state_hdr)))
+#define PC__LOAD(field, mo) __atomic_load_n(&(field), mo)
 
 static struct procctl__ctx *pc__c(procctl_t *ctx) {
   return (struct procctl__ctx *)(void *)ctx->opaque;
@@ -943,20 +1007,29 @@ static int pc__valid_consumer(const char *s) {
 
 /* ---- state block ------------------------------------------------------- */
 
+struct procctl__grant_track { /* private tail of state_storage, one per slot */
+  uint64_t grant_id;
+  uint64_t first_seen_ns;
+};
+
+#define PC__TRACK(c) ((struct procctl__grant_track *)(void *)(c)->grant_track)
+
 static size_t pc__state_used(struct procctl__ctx *c) {
-  return PROCCTL_STATE_HDR_SIZE + (size_t)c->slots * PROCCTL_ENTRY_SIZE +
-         pc__ld32(c->state + PC__S_LEN);
+  return sizeof(struct procctl_state_hdr) + (size_t)c->slots * sizeof(struct procctl_res_entry) +
+         PC__SH(c)->state_len;
 }
 
 /* CRC32C of the used block with seq and crc32c taken as zero (SPEC §6). */
 static uint32_t pc__state_crc(struct procctl__ctx *c) {
   static const uint8_t zero8[8] = {0};
+  const size_t seq = offsetof(struct procctl_state_hdr, seq);
+  const size_t crcf = offsetof(struct procctl_state_hdr, crc32c);
   uint32_t crc = ~0u;
-  crc = procctl__crc_update(crc, c->state, PC__S_SEQ);
-  crc = procctl__crc_update(crc, zero8, 8);
-  crc = procctl__crc_update(crc, c->state + 16, PC__S_CRC - 16);
-  crc = procctl__crc_update(crc, zero8, 4);
-  crc = procctl__crc_update(crc, c->state + PC__S_CRC + 4, pc__state_used(c) - (PC__S_CRC + 4));
+  crc = procctl__crc_update(crc, c->state, seq);
+  crc = procctl__crc_update(crc, zero8, sizeof PC__SH(c)->seq);
+  crc = procctl__crc_update(crc, c->state + seq + 8, crcf - (seq + 8));
+  crc = procctl__crc_update(crc, zero8, sizeof PC__SH(c)->crc32c);
+  crc = procctl__crc_update(crc, c->state + crcf + 4, pc__state_used(c) - (crcf + 4));
   return ~crc;
 }
 
@@ -972,34 +1045,39 @@ static int pc__state_lock(struct procctl__ctx *c, int lflags) {
   }
 }
 
+static void pc__state_unlock(struct procctl__ctx *c) {
+  __atomic_store_n(&c->state_lock, 0, __ATOMIC_RELEASE);
+}
+
 /* Begin a state update: seq → odd (SPEC §7.2). Caller holds the lock. */
 static void pc__state_begin(struct procctl__ctx *c) {
-  uint64_t *seq = (uint64_t *)(void *)(c->state + PC__S_SEQ);
+  uint64_t *seq = &PC__SH(c)->seq;
   __atomic_store_n(seq, __atomic_load_n(seq, __ATOMIC_RELAXED) + 1, __ATOMIC_RELAXED);
   __atomic_thread_fence(__ATOMIC_RELEASE);
 }
 
 static void pc__state_end(struct procctl__ctx *c) {
-  uint64_t *seq = (uint64_t *)(void *)(c->state + PC__S_SEQ);
-  pc__st32(c->state + PC__S_PID, (uint32_t)c->pid);
-  pc__st32(c->state + PC__S_CRC, pc__state_crc(c));
-  uint64_t s = __atomic_load_n(seq, __ATOMIC_RELAXED) + 1;
-  __atomic_store_n(seq, s, __ATOMIC_RELEASE);
-  __atomic_store_n(&c->state_lock, 0, __ATOMIC_RELEASE);
+  struct procctl_state_hdr *sh = PC__SH(c);
+  sh->writer_pid = (uint32_t)c->pid;
+  sh->crc32c = pc__state_crc(c);
+  uint64_t s = __atomic_load_n(&sh->seq, __ATOMIC_RELAXED) + 1;
+  __atomic_store_n(&sh->seq, s, __ATOMIC_RELEASE);
+  pc__state_unlock(c);
   if (c->flags & PROCCTL_F_STATE_PROBE) {
-    uint64_t seen = pc__ld64(c->state + PC__S_SEEN);
+    uint64_t seen = sh->grants_seen_gen;
     PROCCTL__PROBE_STATE(s, seen);
   }
 }
 
 static void pc__state_reset(struct procctl__ctx *c) {
+  struct procctl_state_hdr *sh = PC__SH(c);
   memset(c->state, 0, c->state_block_size);
-  memcpy(c->state + PC__S_MAGIC, "PROCSTAT", 8);
-  pc__st64(c->state + PC__S_INSTANCE, c->instance_id);
-  pc__st32(c->state + PC__S_PID, (uint32_t)c->pid);
-  pc__st64(c->state + PC__S_SEQ, 2);
-  pc__st32(c->state + PC__S_CRC, pc__state_crc(c));
-  memset(c->grant_track, 0, (size_t)c->slots * 16u);
+  memcpy(sh->magic, "PROCSTAT", sizeof sh->magic);
+  sh->instance_id = c->instance_id;
+  sh->writer_pid = (uint32_t)c->pid;
+  sh->seq = 2;
+  sh->crc32c = pc__state_crc(c);
+  memset(c->grant_track, 0, (size_t)c->slots * sizeof(struct procctl__grant_track));
 }
 
 /* ---- region ---------------------------------------------------------------- */
@@ -1008,9 +1086,11 @@ static int pc__create_region(struct procctl__ctx *c) {
   long page = sysconf(_SC_PAGESIZE);
   if (page < 4096 || page > 65536 || (page & (page - 1))) return -EINVAL;
   size_t P = (size_t)page;
-  size_t need = PROCCTL_CTRL_SIZE + (size_t)c->slots * PROCCTL_ENTRY_SIZE + c->payload_capacity;
+  size_t need = sizeof(struct procctl_ctrl) +
+                (size_t)c->slots * sizeof(struct procctl_grant_entry) + c->payload_capacity;
   size_t area = (need + P - 1) / P * P;
   size_t total = P + area;
+  struct procctl_wire_header h;
   void *m;
 
   int fd = (int)syscall(SYS_memfd_create, c->memfd_name,
@@ -1023,28 +1103,25 @@ static int pc__create_region(struct procctl__ctx *c) {
   c->instance_id = pc__random64();
   pc__state_reset(c);
 
-  {
-    uint8_t h[PROCCTL_HEADER_SIZE];
-    memset(h, 0, sizeof h);
-    memcpy(h + PC__H_SIG, "PROC_CTL", 8);
-    pc__st16(h + PC__H_MAJOR, PROCCTL_SPEC_MAJOR);
-    pc__st16(h + PC__H_MINOR, PROCCTL_SPEC_MINOR);
-    pc__st32(h + PC__H_HSIZE, PROCCTL_HEADER_SIZE);
-    pc__st64(h + PC__H_TOTAL, total);
-    pc__st32(h + PC__H_PAGE, (uint32_t)P);
-    memcpy(h + PC__H_CONSUMER, c->consumer, strlen(c->consumer));
-    pc__st32(h + PC__H_SCHEMA, c->schema_version);
-    pc__st32(h + PC__H_CREATOR, (uint32_t)getpid());
-    pc__st64(h + PC__H_AREA_OFF, P);
-    pc__st64(h + PC__H_AREA_SIZE, area);
-    pc__st64(h + PC__H_STATE_ADDR, (uint64_t)(uintptr_t)c->state);
-    pc__st32(h + PC__H_STATE_SIZE, c->state_block_size);
-    pc__st16(h + PC__H_SLOTS, c->slots);
-    pc__st64(h + PC__H_CREATED, procctl_now_ns());
-    pc__st64(h + PC__H_INSTANCE, c->instance_id);
-    pc__st32(h + PC__H_CRC, procctl__crc32c(h, PC__H_CRC));
-    if (pwrite(fd, h, sizeof h, 0) != (ssize_t)sizeof h) goto fail;
-  }
+  memset(&h, 0, sizeof h);
+  memcpy(h.signature, "PROC_CTL", sizeof h.signature);
+  h.spec_major = PROCCTL_SPEC_MAJOR;
+  h.spec_minor = PROCCTL_SPEC_MINOR;
+  h.header_size = (uint32_t)sizeof h;
+  h.total_size = total;
+  h.page_size = (uint32_t)P;
+  memcpy(h.consumer, c->consumer, strlen(c->consumer));
+  h.schema_version = c->schema_version;
+  h.creator_pid = (uint32_t)getpid();
+  h.agent_area_off = P;
+  h.agent_area_size = area;
+  h.state_addr = (uint64_t)(uintptr_t)c->state;
+  h.state_size = c->state_block_size;
+  h.resource_slots = c->slots;
+  h.created_at_ns = procctl_now_ns();
+  h.instance_id = c->instance_id;
+  h.header_crc32c = procctl__crc32c(&h, offsetof(struct procctl_wire_header, header_crc32c));
+  if (pwrite(fd, &h, sizeof h, 0) != (ssize_t)sizeof h) goto fail;
   if (fcntl(fd, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL) != 0) goto fail;
 
   m = mmap(NULL, total, PROT_READ, MAP_SHARED, fd, 0);
@@ -1055,7 +1132,7 @@ static int pc__create_region(struct procctl__ctx *c) {
   c->map_size = total;
   c->area = c->map + P;
   c->area_size = area;
-  c->seq = (const uint64_t *)(const void *)(c->area + PC__C_SEQ);
+  c->seq = &PC__CTRL(c)->seq;
   __atomic_store_n(&c->last_seen, 0, __ATOMIC_RELAXED);
   __atomic_store_n(&c->hb_seen, 0, __ATOMIC_RELAXED);
   __atomic_store_n(&c->hb_local_ns, procctl_now_ns(), __ATOMIC_RELAXED);
@@ -1129,7 +1206,7 @@ PROCCTL_DEF int procctl_reinit(procctl_t *ctx) {
   munmap((void *)c->map, c->map_size);
   close(c->fd);
   c->pid = getpid();
-  __atomic_store_n(&c->state_lock, 0, __ATOMIC_RELAXED);
+  pc__state_unlock(c);
   int r = pc__create_region(c);
   if (r) return r;
   c->ready = 1;
@@ -1143,33 +1220,36 @@ PROCCTL_DEF int procctl_reinit(procctl_t *ctx) {
 
 /* ---- agent area reads (SPEC §7.1) ------------------------------------------- */
 
-/* Streams the agent payload [64, 64 + slots*48 + n) of the area through the
+/* Streams the agent payload (grant table, then consumer payload) through the
  * seqlock reader. grants (may be NULL) receives the grant table; payload (may
- * be NULL) receives the consumer payload. Returns 0, -EAGAIN (busy/torn). */
-static int pc__read_payload(struct procctl__ctx *c, uint64_t s1, uint8_t *grants, uint8_t *payload,
-                            size_t payload_cap, size_t *len_out, uint32_t *flags_out) {
-  const uint8_t *a = c->area;
-  uint32_t n = pc__aload32(a + PC__C_LEN, __ATOMIC_RELAXED);
-  uint32_t want_crc = pc__aload32(a + PC__C_CRC, __ATOMIC_RELAXED);
-  uint32_t flags = pc__aload32(a + PC__C_FLAGS, __ATOMIC_RELAXED);
-  size_t gt = (size_t)c->slots * PROCCTL_ENTRY_SIZE;
-  if (PROCCTL_CTRL_SIZE + gt + (size_t)n > c->area_size) return -EAGAIN;
+ * be NULL) receives the consumer payload. Returns 0, -EAGAIN (busy/torn) or
+ * -E2BIG. */
+static int pc__read_payload(struct procctl__ctx *c, uint64_t s1, struct procctl_grant_entry *grants,
+                            uint8_t *payload, size_t payload_cap, size_t *len_out,
+                            uint32_t *flags_out) {
+  const struct procctl_ctrl *cb = PC__CTRL(c);
+  uint32_t n = PC__LOAD(cb->payload_len, __ATOMIC_RELAXED);
+  uint32_t want_crc = PC__LOAD(cb->payload_crc32c, __ATOMIC_RELAXED);
+  uint32_t flags = PC__LOAD(cb->flags, __ATOMIC_RELAXED);
+  size_t gt = (size_t)c->slots * sizeof(struct procctl_grant_entry);
+  if (sizeof *cb + gt + (size_t)n > c->area_size) return -EAGAIN;
   if (payload && n > payload_cap) return -E2BIG;
+  const uint64_t *src = (const uint64_t *)(const void *)(c->area + sizeof *cb);
+  uint8_t *gdst = (uint8_t *)grants;
   uint32_t crc = ~0u;
-  const uint8_t *src = a + PROCCTL_CTRL_SIZE;
   size_t total = gt + n;
   for (size_t off = 0; off < total; off += 8) {
-    uint64_t w = pc__aload64(src + off, __ATOMIC_RELAXED);
+    uint64_t w = __atomic_load_n(&src[off / 8], __ATOMIC_RELAXED);
     size_t take = total - off < 8 ? total - off : 8;
     crc = procctl__crc_update(crc, &w, take);
     if (off < gt) {
-      if (grants) memcpy(grants + off, &w, take); /* gt is a multiple of 8 */
+      if (gdst) memcpy(gdst + off, &w, take); /* gt is a multiple of 8 */
     } else if (payload) {
       memcpy(payload + (off - gt), &w, take);
     }
   }
   __atomic_thread_fence(__ATOMIC_ACQUIRE);
-  uint64_t s2 = pc__aload64(a + PC__C_SEQ, __ATOMIC_RELAXED);
+  uint64_t s2 = PC__LOAD(cb->seq, __ATOMIC_RELAXED);
   if (s2 != s1 || ~crc != want_crc) return -EAGAIN;
   if (len_out) *len_out = n;
   if (flags_out) *flags_out = flags;
@@ -1178,10 +1258,11 @@ static int pc__read_payload(struct procctl__ctx *c, uint64_t s1, uint8_t *grants
 
 PROCCTL_DEF int procctl__poll_slow(struct procctl__ctx *c, uint64_t s1, void *buf, size_t cap,
                                    uint64_t *gen) {
+  const struct procctl_ctrl *cb = PC__CTRL(c);
   uint64_t old = __atomic_load_n(&c->last_seen, __ATOMIC_RELAXED);
   if (s1 == old) return 0;
   if ((s1 & 1u) || s1 == 0) return -EAGAIN;
-  if (pc__aload32(c->area + PC__C_LEN, __ATOMIC_RELAXED) > cap) {
+  if (PC__LOAD(cb->payload_len, __ATOMIC_RELAXED) > cap) {
     if (__atomic_compare_exchange_n(&c->last_seen, &old, s1, 0, __ATOMIC_RELAXED,
                                     __ATOMIC_RELAXED))
       return -E2BIG;
@@ -1202,14 +1283,14 @@ PROCCTL_DEF int procctl__poll_slow(struct procctl__ctx *c, uint64_t s1, void *bu
       return (int)n;
     }
     if (r == -E2BIG) return -E2BIG;
-    if (pc__aload64(c->area + PC__C_SEQ, __ATOMIC_ACQUIRE) != s1) break;
+    if (PC__LOAD(cb->seq, __ATOMIC_ACQUIRE) != s1) break;
   }
   return -EAGAIN;
 }
 
 PROCCTL_DEF bool procctl_agent_attached(const procctl_t *ctx) {
   const struct procctl__ctx *c = (const struct procctl__ctx *)(const void *)ctx->opaque;
-  return c->ready && pc__aload64(c->area + PC__C_WRITER, __ATOMIC_ACQUIRE) != 0;
+  return c->ready && PC__LOAD(PC__CTRL(c)->writer_id, __ATOMIC_ACQUIRE) != 0;
 }
 
 /* ---- lease (SPEC §8.3) ---------------------------------------------------------- */
@@ -1218,10 +1299,11 @@ PROCCTL_DEF bool procctl_lease_expired(procctl_t *ctx, uint64_t now_ns) {
   struct procctl__ctx *c = pc__c(ctx);
   if (!c->ready) return true;
   if (!now_ns) now_ns = procctl_now_ns();
+  const struct procctl_ctrl *cb = PC__CTRL(c);
   bool expired;
-  uint64_t writer = pc__aload64(c->area + PC__C_WRITER, __ATOMIC_ACQUIRE);
-  uint64_t lease = pc__aload64(c->area + PC__C_LEASE, __ATOMIC_ACQUIRE);
-  uint64_t hb = pc__aload64(c->area + PC__C_HB, __ATOMIC_ACQUIRE);
+  uint64_t writer = PC__LOAD(cb->writer_id, __ATOMIC_ACQUIRE);
+  uint64_t lease = PC__LOAD(cb->lease_ns, __ATOMIC_ACQUIRE);
+  uint64_t hb = PC__LOAD(cb->heartbeat_ns, __ATOMIC_ACQUIRE);
   if (writer == 0) {
     expired = true;
   } else {
@@ -1244,10 +1326,11 @@ PROCCTL_DEF int procctl_ack(procctl_t *ctx, uint64_t gen, int lflags) {
   if (!c->ready) return -ENODEV;
   int r = pc__state_lock(c, lflags);
   if (r) return r;
-  uint64_t w = pc__aload64(c->area + PC__C_WRITER, __ATOMIC_ACQUIRE);
+  uint64_t w = PC__LOAD(PC__CTRL(c)->writer_id, __ATOMIC_ACQUIRE);
+  struct procctl_state_hdr *sh = PC__SH(c);
   pc__state_begin(c);
-  if (gen > pc__ld64(c->state + PC__S_APPLIED)) pc__st64(c->state + PC__S_APPLIED, gen);
-  pc__st64(c->state + PC__S_APPLIED_W, w);
+  if (gen > sh->applied_gen) sh->applied_gen = gen;
+  sh->applied_writer_id = w;
   pc__state_end(c);
   return 0;
 }
@@ -1259,9 +1342,8 @@ PROCCTL_DEF int procctl_state_set(procctl_t *ctx, const void *state, size_t len,
   int r = pc__state_lock(c, lflags);
   if (r) return r;
   pc__state_begin(c);
-  uint8_t *dst = c->state + PROCCTL_STATE_HDR_SIZE + (size_t)c->slots * PROCCTL_ENTRY_SIZE;
-  memcpy(dst, state, len);
-  pc__st32(c->state + PC__S_LEN, (uint32_t)len);
+  memcpy(PC__RES(c) + c->slots, state, len); /* consumer state follows the resource table */
+  PC__SH(c)->state_len = (uint32_t)len;
   pc__state_end(c);
   return 0;
 }
@@ -1274,19 +1356,18 @@ PROCCTL_DEF int procctl_grant_get(procctl_t *ctx, uint32_t kind, const uint8_t i
   memset(out, 0, sizeof *out);
   if (!c->ready) return -ENODEV;
   if (c->slots == 0) return -ENOENT;
-  uint8_t table[PROCCTL_MAX_SLOTS * PROCCTL_ENTRY_SIZE];
+  struct procctl_grant_entry table[PROCCTL_MAX_SLOTS];
   for (int tries = 0; tries < 8; tries++) {
-    uint64_t s1 = pc__aload64(c->area + PC__C_SEQ, __ATOMIC_ACQUIRE);
+    uint64_t s1 = PC__LOAD(PC__CTRL(c)->seq, __ATOMIC_ACQUIRE);
     if (s1 & 1u) continue;
     if (s1 == 0) return 0; /* never written: no grants */
     if (pc__read_payload(c, s1, table, NULL, 0, NULL, NULL) != 0) continue;
     out->seen_gen = s1;
     for (unsigned i = 0; i < c->slots; i++) {
-      const uint8_t *e = table + (size_t)i * PROCCTL_ENTRY_SIZE;
-      uint64_t g = pc__ld64(e + PC__E_GRANT);
-      if (g && pc__ld32(e + PC__E_KIND) == kind && memcmp(e + PC__E_ID, id, 16) == 0) {
-        out->grant_id = g;
-        out->duration_ns = pc__ld64(e + PC__E_DUR);
+      const struct procctl_grant_entry *e = &table[i];
+      if (e->grant_id && e->kind == kind && memcmp(e->resource_id, id, 16) == 0) {
+        out->grant_id = e->grant_id;
+        out->duration_ns = e->duration_ns;
         out->kind = kind;
         break;
       }
@@ -1301,22 +1382,20 @@ PROCCTL_DEF bool procctl_grant_usable(procctl_t *ctx, const procctl_grant_t *g, 
   if (!c->ready || !g->grant_id) return false;
   if (!now_ns) now_ns = procctl_now_ns();
   /* Track the first time each grant_id was observed (SPEC §9.1 H1/H3). */
-  uint8_t *t = c->grant_track;
-  int slot = -1, oldest = 0;
-  uint64_t oldest_ns = UINT64_MAX;
+  struct procctl__grant_track *t = PC__TRACK(c), *slot = NULL, *oldest = t;
   for (unsigned i = 0; i < c->slots; i++) {
-    uint64_t gid = pc__ld64(t + i * 16u);
-    uint64_t ts = pc__ld64(t + i * 16u + 8);
-    if (gid == g->grant_id) { slot = (int)i; break; }
-    if (ts < oldest_ns) { oldest_ns = ts; oldest = (int)i; }
+    if (t[i].grant_id == g->grant_id) {
+      slot = &t[i];
+      break;
+    }
+    if (t[i].first_seen_ns < oldest->first_seen_ns) oldest = &t[i];
   }
-  if (slot < 0) {
+  if (!slot) {
     slot = oldest;
-    pc__st64(t + (unsigned)slot * 16u, g->grant_id);
-    pc__st64(t + (unsigned)slot * 16u + 8, now_ns);
+    slot->grant_id = g->grant_id;
+    slot->first_seen_ns = now_ns;
   }
-  uint64_t first = pc__ld64(t + (unsigned)slot * 16u + 8);
-  return now_ns - first < g->duration_ns;
+  return now_ns - slot->first_seen_ns < g->duration_ns;
 }
 
 PROCCTL_DEF int procctl_resource_report(procctl_t *ctx, uint32_t kind, const uint8_t id[16],
@@ -1327,31 +1406,32 @@ PROCCTL_DEF int procctl_resource_report(procctl_t *ctx, uint32_t kind, const uin
   if (c->slots == 0) return -ENOENT;
   int r = pc__state_lock(c, lflags);
   if (r) return r;
-  uint8_t *tab = c->state + PROCCTL_STATE_HDR_SIZE;
-  uint8_t *e = NULL, *empty = NULL;
+  static const uint8_t zero_id[16] = {0};
+  struct procctl_res_entry *tab = PC__RES(c), *e = NULL, *empty = NULL;
   for (unsigned i = 0; i < c->slots; i++) {
-    uint8_t *x = tab + (size_t)i * PROCCTL_ENTRY_SIZE;
-    uint8_t z[16] = {0};
-    if (pc__ld32(x + PC__E_KIND) == kind && memcmp(x + PC__E_ID, id, 16) == 0) { e = x; break; }
-    if (!empty && pc__ld32(x + PC__E_KIND) == 0 && memcmp(x + PC__E_ID, z, 16) == 0) empty = x;
+    struct procctl_res_entry *x = &tab[i];
+    if (x->kind == kind && memcmp(x->resource_id, id, 16) == 0) {
+      e = x;
+      break;
+    }
+    if (!empty && x->kind == 0 && memcmp(x->resource_id, zero_id, 16) == 0) empty = x;
   }
   if (!e) e = empty;
   if (!e) {
-    __atomic_store_n(&c->state_lock, 0, __ATOMIC_RELEASE);
+    pc__state_unlock(c);
     return -ENOSPC;
   }
   pc__state_begin(c);
-  memcpy(e + PC__E_ID, id, 16);
-  pc__st64(e + PC__E_GRANT, grant_id);
+  memcpy(e->resource_id, id, 16);
+  e->grant_id = grant_id;
   if ((flags & PROCCTL_RES_F_WANT) || state == PROCCTL_RES_ACQUIRING ||
       state == PROCCTL_RES_HOLDING)
-    pc__st64(e + PC__E_ACTIVITY, procctl_now_ns());
-  pc__st32(e + PC__E_KIND, kind);
-  pc__st32(e + PC__E_STATE, state);
-  pc__st32(e + PC__E_FLAGS, flags);
-  pc__st32(e + PC__E_ERROR, error);
-  if (grants_seen_gen > pc__ld64(c->state + PC__S_SEEN))
-    pc__st64(c->state + PC__S_SEEN, grants_seen_gen);
+    e->last_activity_ns = procctl_now_ns();
+  e->kind = kind;
+  e->state = state;
+  e->flags = flags;
+  e->error = error;
+  if (grants_seen_gen > PC__SH(c)->grants_seen_gen) PC__SH(c)->grants_seen_gen = grants_seen_gen;
   pc__state_end(c);
   return 0;
 }
@@ -1361,7 +1441,8 @@ PROCCTL_DEF int procctl_resource_report(procctl_t *ctx, uint32_t kind, const uin
 PROCCTL_DEF int procctl_wait(procctl_t *ctx, uint64_t timeout_ns) {
   struct procctl__ctx *c = pc__c(ctx);
   if (!c->ready) return -ENODEV;
-  const uint32_t *word = (const uint32_t *)(const void *)(c->area + PC__C_SEQ);
+  /* The wake word is the low 32 bits of seq (little-endian: its first 4 bytes). */
+  const uint32_t *word = (const uint32_t *)(const void *)&PC__CTRL(c)->seq;
   uint32_t v = __atomic_load_n(word, __ATOMIC_ACQUIRE);
   struct timespec ts;
   ts.tv_sec = (time_t)(timeout_ns / 1000000000ull);
