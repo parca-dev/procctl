@@ -1,0 +1,11 @@
+# Local images loaded into kind with `kind load docker-image`.
+resources:
+  - ../../base/agent
+  - ../../base/clients
+images:
+  - name: ghcr.io/parca-dev/procctl-testagent
+    newName: procctl-testagent
+    newTag: dev
+  - name: ghcr.io/parca-dev/procctl-testclient
+    newName: procctl-testclient
+    newTag: dev

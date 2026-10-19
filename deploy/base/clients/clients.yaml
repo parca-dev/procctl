@@ -1,0 +1,40 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: procctl-clients
+  labels:
+    # The client is an ordinary unprivileged workload (scenario S10).
+    pod-security.kubernetes.io/enforce: restricted
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: procctl-testclient
+  namespace: procctl-clients
+  labels: {app: procctl-testclient}
+spec:
+  replicas: 4
+  selector:
+    matchLabels: {app: procctl-testclient}
+  template:
+    metadata:
+      labels: {app: procctl-testclient}
+    spec:
+      terminationGracePeriodSeconds: 2
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: client
+          image: ghcr.io/parca-dev/procctl-testclient:latest
+          args: ["--poll-us=1000"]
+          env:
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          resources:
+            requests: {cpu: 10m, memory: 8Mi}

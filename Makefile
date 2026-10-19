@@ -7,7 +7,7 @@ SAN    := -fsanitize=address,undefined -fno-sanitize-recover=all
 generate:
 	scripts/gen-types.sh
 
-.PHONY: generate all test test-c test-c-compile test-go bench fuzz-go fuzz-c model-long kernel-report demo clean
+.PHONY: images e2e-kind generate all test test-c test-c-compile test-go bench fuzz-go fuzz-c model-long kernel-report demo clean
 
 all: $(BIN)/echo-client $(BIN)/echo-agent
 
@@ -63,6 +63,16 @@ kernel-report:
 	echo "yama ptrace_scope: $$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo n/a)"; \
 	echo "perf_event_paranoid: $$(cat /proc/sys/kernel/perf_event_paranoid)"; \
 	echo "unprivileged_userfaultfd: $$(cat /proc/sys/vm/unprivileged_userfaultfd 2>/dev/null || echo n/a)"
+
+# Test images for the e2e suite (local, for kind).
+images:
+	docker build -f testclient/Dockerfile -t procctl-testclient:dev .
+	docker build -f cmd/procctl-testagent/Dockerfile -t procctl-testagent:dev .
+
+# The e2e suite on a kind cluster named procctl-e2e (created if needed;
+# E2E_KEEP_CLUSTER=1 keeps it afterwards).
+e2e-kind: images
+	cd e2e && go test -count=1 -timeout 45m -v ./...
 
 demo: all
 	examples/echo/demo.sh

@@ -22,6 +22,11 @@ type RegistryOptions struct {
 	ReadTimeout    time.Duration // remote state reads; default 1s
 	MaxRegionSize  int64
 	Logger         *slog.Logger
+	// ForceProcFallback skips pidfd_getfd and opens /proc/<pid>/fd/<n>.
+	ForceProcFallback bool
+	// OnReject, if set, is called for every region that fails attach or
+	// validation (SPEC §10.2), e.g. to count rejections by reason.
+	OnReject func(pid, fd int, err error)
 }
 
 // EventKind distinguishes registry events.
@@ -170,9 +175,13 @@ func (r *Registry) scan(ctx context.Context, pid int) {
 		c, err := Attach(cand.HostPID, cand.FD, AttachOptions{
 			ProcRoot: r.opt.ProcRoot, MaxRegionSize: r.opt.MaxRegionSize,
 			Identity: r.id, Lease: r.opt.Lease, ReadTimeout: r.opt.ReadTimeout,
+			ForceProcFallback: r.opt.ForceProcFallback,
 		})
 		if err != nil {
 			r.log.Info("attach rejected", "pid", cand.HostPID, "fd", cand.FD, "err", err)
+			if r.opt.OnReject != nil {
+				r.opt.OnReject(cand.HostPID, cand.FD, err)
+			}
 			continue
 		}
 		r.add(c)
