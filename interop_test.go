@@ -449,3 +449,56 @@ func fmtSscan(s string, v *int) (int, error) {
 	*v = n
 	return 1, nil
 }
+
+// Every attach path × read path: pidfd_getfd or /proc/<pid>/fd, and
+// process_vm_readv or /proc/<pid>/mem (scenario S11).
+func TestAttachAndReadPaths(t *testing.T) {
+	bin := buildC(t, "examples/echo/client.c")
+	p := startProc(t, bin, "--interval-ms", "5")
+	pid := p.cmd.Process.Pid
+	var cand Candidate
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		cands, _, _ := Scan(context.Background(), ScanOptions{Consumer: "echo", PIDs: []int{pid}})
+		if len(cands) == 1 {
+			cand = cands[0]
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("region not found")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	for _, tc := range []struct {
+		procFD, procMem  bool
+		attach, readPath string
+	}{
+		{false, false, "pidfd_getfd", "process_vm_readv"},
+		{true, false, "proc", "process_vm_readv"},
+		{false, true, "pidfd_getfd", "proc_mem"},
+		{true, true, "proc", "proc_mem"},
+	} {
+		id, _ := NewIdentity()
+		c, err := Attach(pid, cand.FD, AttachOptions{Identity: id, ForceProcFallback: tc.procFD, ForceMemFallback: tc.procMem})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := c.Info(); got.AttachPath != tc.attach || got.ReadPath != tc.readPath {
+			t.Errorf("paths %s/%s, want %s/%s", got.AttachPath, got.ReadPath, tc.attach, tc.readPath)
+		}
+		c.mu.Lock()
+		c.claimLocked(time.Now())
+		c.mu.Unlock()
+		gen, _, err := c.Write([]byte("paths"), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		if err := c.WaitAck(ctx, gen); err != nil {
+			t.Errorf("%s/%s: %v", tc.attach, tc.readPath, err)
+		}
+		cancel()
+		c.release(true)
+		c.Close()
+	}
+}

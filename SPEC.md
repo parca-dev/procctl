@@ -100,8 +100,8 @@ Written once with `pwrite` before sealing (§3.1 step 4). Never modified afterwa
 | 68 | 4 | `creator_pid` | The process's pid in its own pid namespace. Informational only (§10.3). |
 | 72 | 8 | `agent_area_off` | `P` |
 | 80 | 8 | `agent_area_size` | A multiple of `P`, ≥ `P` |
-| 88 | 8 | `state_addr` | Address of the state block in the process's address space; 8-byte aligned; 0 = no state block |
-| 96 | 4 | `state_size` | Capacity of the state block in bytes: a multiple of 8, in [64, 65536]; 0 if `state_addr` is 0 |
+| 88 | 8 | `state_addr` | Address of the state block in the process's address space; non-zero, 8-byte aligned. Every region has a state block. |
+| 96 | 4 | `state_size` | Capacity of the state block in bytes: a multiple of 8, in [64, 65536] |
 | 100 | 2 | `resource_slots` | Number of grant-table and resource-table entries, 0..64 |
 | 102 | 2 | reserved | 0 |
 | 104 | 8 | `created_at_ns` | `CLOCK_BOOTTIME` at creation |
@@ -158,7 +158,7 @@ An all-zero entry is an empty slot. A process holds a grant for `(kind, resource
 
 ## 6. State block (process private memory)
 
-A process that reports state keeps a state block at `state_addr`, in its own private memory. It is never shared and never written by agents.
+Every process keeps a state block at `state_addr`, in its own private memory: it is how the process acks configuration (§8.2), reports holdings (§9.1) and publishes consumer state. A region without one could be written but never verified, so there is no such mode. It is never shared and never written by agents.
 
 | Off | Size | Field | Definition |
 |---:|---:|---|---|
@@ -428,7 +428,7 @@ Before using a region, an agent MUST perform these steps in order, and reject th
    - `consumer` equal to the name suffix;
    - `agent_area_off == page_size`, and `agent_area_off + agent_area_size == total_size`;
    - `resource_slots ≤ 64`, and 64 + `resource_slots` × 48 ≤ `agent_area_size`;
-   - if `state_addr ≠ 0`: it is 8-byte aligned, `state_size` is a multiple of 8 in [64, 65536], and 64 + `resource_slots` × 48 ≤ `state_size`.
+   - `state_addr` is non-zero and 8-byte aligned, `state_size` is a multiple of 8 in [64, 65536], and 64 + `resource_slots` × 48 ≤ `state_size`.
 7. **Use only the snapshot from then on.** The agent MUST NOT re-read the header from shared memory.
 8. **De-duplicate** by `(st_dev, st_ino)`.
 

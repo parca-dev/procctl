@@ -2,7 +2,10 @@ module github.com/parca-dev/procctl/e2e
 
 go 1.25.7
 
-require sigs.k8s.io/e2e-framework v0.7.0
+require (
+	golang.org/x/sys v0.38.0
+	sigs.k8s.io/e2e-framework v0.7.0
+)
 
 require (
 	github.com/beorn7/perks v1.0.1 // indirect
@@ -40,7 +43,6 @@ require (
 	go.yaml.in/yaml/v3 v3.0.4 // indirect
 	golang.org/x/net v0.47.0 // indirect
 	golang.org/x/oauth2 v0.30.0 // indirect
-	golang.org/x/sys v0.38.0 // indirect
 	golang.org/x/term v0.37.0 // indirect
 	golang.org/x/text v0.31.0 // indirect
 	golang.org/x/time v0.9.0 // indirect

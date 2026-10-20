@@ -9,8 +9,12 @@
  * CLOCK_BOOTTIME timestamps; the e2e suite reads them from the pod logs and
  * never relies on the agent's view for correctness checks.
  *
- *   procctl-testclient [--poll-us 1000] [--exclusive] [--acquire-ms 300]
- *                      [--exit-after-s N]
+ *   procctl-testclient [--poll-us 1000] [--exclusive [--acquire-ms 300] [--holder-hang]]
+ *                      [--exit-after-s N] [--init-delay-ms N]
+ *                      [--fork-after-ms N [--fork-workers K] [--fork-reinit]]
+ *   procctl-testclient --hostile=MODE     a deliberately broken region (S8)
+ *   procctl-testclient --noise-procs=N [--noise-fds=M] [--exec-rate=R]
+ *                                         scan and exec load, no region (S9)
  *
  * SPDX-License-Identifier: Apache-2.0 */
 #define _GNU_SOURCE
@@ -26,6 +30,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/prctl.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #define SLOTS 1
@@ -37,6 +43,7 @@ static struct testclient_status g_st;
 static pthread_mutex_t g_st_mu = PTHREAD_MUTEX_INITIALIZER;
 static uint8_t g_token_id[16];
 static long g_acquire_ms = 300;
+static int g_holder_hang;
 static pthread_mutex_t g_out_mu = PTHREAD_MUTEX_INITIALIZER;
 
 static void logj(const char *ev, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
@@ -124,12 +131,133 @@ static void *control_thread(void *arg) {
       publish();
       pthread_mutex_unlock(&g_st_mu);
       report(PROCCTL_RES_HOLDING, held, g.seen_gen);
+      if (g_holder_hang) {
+        logj("hang", "\"grant\":%llu", (unsigned long long)held);
+        for (;;) pause(); /* holds forever: the arbiter must never re-grant */
+      }
     } else {
       report(held ? PROCCTL_RES_HOLDING : PROCCTL_RES_IDLE, held, g.seen_gen);
     }
     procctl_wait(&g_ctx, 50000000ull);
   }
   return NULL;
+}
+
+/* ---- hostile regions (S8) ---------------------------------------------------- */
+
+/* Builds a region by hand, like procctl_init, with one thing wrong, and keeps
+ * it open. The agent must reject it (or, for the state modes, isolate it) and
+ * stay healthy. */
+static _Alignas(8) unsigned char g_hstate[64 + ((sizeof(struct testclient_status) + 7) & ~7ul)];
+
+static int hostile(const char *mode) {
+  long P = sysconf(_SC_PAGESIZE);
+  size_t area = (size_t)P, total = (size_t)P + area;
+  static const char *const modes[] = {"no-seals",  "grow-seal-missing", "write-sealed",   "wrong-size",
+                                      "spoof-name", "spoof-pid",         "bad-crc",        "bad-offsets",
+                                      "huge-len",   "bad-state-addr",    "state-never-even", "no-state"};
+  int known = 0;
+  for (size_t i = 0; i < sizeof modes / sizeof *modes; i++) known |= !strcmp(mode, modes[i]);
+  if (!known) {
+    fprintf(stderr, "unknown hostile mode %s\n", mode);
+    return 2;
+  }
+#define MODE(m) (!strcmp(mode, m))
+  const char *name = "procctl:" TESTCLIENT_CONSUMER "-v1";
+  int fd = (int)syscall(SYS_memfd_create, name, MFD_CLOEXEC | MFD_ALLOW_SEALING);
+  if (fd < 0 || ftruncate(fd, (off_t)total) != 0) {
+    logj("hostile_failed", "\"errno\":%d", errno);
+    return 1;
+  }
+  /* A valid state block carrying a valid status, so accepted modes report
+   * who they are. */
+  struct procctl_state_hdr sh;
+  memset(&sh, 0, sizeof sh);
+  uint64_t inst = procctl_now_ns() | 1;
+  uint32_t state_len = (uint32_t)sizeof g_st;
+  memcpy(sh.magic, "PROCSTAT", 8);
+  sh.instance_id = inst;
+  sh.writer_pid = (uint32_t)getpid();
+  sh.state_len = state_len;
+  memcpy(g_hstate, &sh, sizeof sh);
+  memcpy(g_hstate + sizeof sh, &g_st, sizeof g_st);
+  ((struct procctl_state_hdr *)g_hstate)->crc32c = procctl__crc32c(g_hstate, sizeof sh + state_len);
+  ((struct procctl_state_hdr *)g_hstate)->seq = MODE("state-never-even") ? 3 : 2;
+
+  struct procctl_wire_header h;
+  memset(&h, 0, sizeof h);
+  memcpy(h.signature, "PROC_CTL", 8);
+  h.spec_major = PROCCTL_SPEC_MAJOR;
+  h.spec_minor = PROCCTL_SPEC_MINOR;
+  h.header_size = (uint32_t)sizeof h;
+  h.total_size = MODE("wrong-size") ? total + (size_t)P : total;
+  h.page_size = (uint32_t)P;
+  memcpy(h.consumer, MODE("spoof-name") ? "other" : TESTCLIENT_CONSUMER,
+         strlen(MODE("spoof-name") ? "other" : TESTCLIENT_CONSUMER));
+  h.schema_version = TESTCLIENT_SCHEMA_VERSION;
+  h.creator_pid = MODE("spoof-pid") ? 4242 : (uint32_t)getpid(); /* informational only */
+  h.agent_area_off = MODE("bad-offsets") ? 2 * (uint64_t)P : (uint64_t)P;
+  h.agent_area_size = area;
+  h.state_addr = MODE("bad-state-addr") ? 0x10000 : MODE("no-state") ? 0 : (uint64_t)(uintptr_t)g_hstate;
+  h.state_size = MODE("huge-len") ? 1u << 20 : (uint32_t)sizeof g_hstate;
+  h.created_at_ns = procctl_now_ns();
+  h.instance_id = inst;
+  h.header_crc32c = procctl__crc32c(&h, offsetof(struct procctl_wire_header, header_crc32c));
+  if (MODE("bad-crc")) h.header_crc32c ^= 1;
+  if (pwrite(fd, &h, sizeof h, 0) != (ssize_t)sizeof h) return 1;
+
+  int seals = F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL;
+  if (MODE("grow-seal-missing")) seals &= ~F_SEAL_GROW;
+  if (MODE("write-sealed")) seals |= F_SEAL_WRITE;
+  if (!MODE("no-seals") && fcntl(fd, F_ADD_SEALS, seals) != 0) {
+    logj("hostile_failed", "\"errno\":%d", errno);
+    return 1;
+  }
+#undef MODE
+  logj("hostile", "\"mode\":\"%s\",\"fd\":%d", mode, fd);
+  for (;;) pause();
+}
+
+/* ---- noise (S9) ----------------------------------------------------------------- */
+
+/* N idle processes holding M fds each (scan cost), plus an exec storm of R
+ * short-lived execs per second (mapping events). No procctl region. */
+static int noise(long procs, long fds, long exec_rate, const char *self) {
+  for (long i = 0; i < procs; i++) {
+    pid_t c = fork();
+    if (c == 0) {
+      prctl(PR_SET_PDEATHSIG, SIGKILL);
+      for (long k = 0; k < fds; k++)
+        if (dup(0) < 0) break;
+      for (;;) pause();
+    }
+    if (c < 0) {
+      logj("noise_failed", "\"errno\":%d,\"procs\":%ld", errno, i);
+      break;
+    }
+  }
+  logj("noise", "\"procs\":%ld,\"fds\":%ld,\"exec_rate\":%ld", procs, fds, exec_rate);
+  uint64_t execs = 0, last_log = procctl_now_ns();
+  for (;;) {
+    if (exec_rate <= 0) {
+      pause();
+      continue;
+    }
+    pid_t c = fork();
+    if (c == 0) {
+      execl(self, self, "--noop", (char *)NULL);
+      _exit(127);
+    }
+    if (c > 0) execs++;
+    while (waitpid(-1, NULL, WNOHANG) > 0) {
+    }
+    usleep((useconds_t)(1000000 / exec_rate));
+    uint64_t now = procctl_now_ns();
+    if (now - last_log > 10000000000ull) {
+      logj("execs", "\"total\":%llu", (unsigned long long)execs);
+      last_log = now;
+    }
+  }
 }
 
 /* ---- main loop: poll, verify, ack ------------------------------------------- */
@@ -150,6 +278,8 @@ static int verify(const uint8_t *b, int n, uint64_t *tag, uint64_t *write_ns) {
 int main(int argc, char **argv) {
   long poll_us = 1000, exit_after_s = 0, init_delay_ms = 0, fork_after_ms = 0, fork_workers = 1;
   int exclusive = 0, fork_reinit = 0;
+  long noise_procs = 0, noise_fds = 0, exec_rate = 0;
+  const char *hostile_mode = NULL;
   for (int i = 1; i < argc; i++) {
     /* Accept both "--opt value" and "--opt=value". */
     char name[64];
@@ -171,10 +301,18 @@ int main(int argc, char **argv) {
     else if (!strcmp(name, "--fork-after-ms")) fork_after_ms = atol(NEXT());
     else if (!strcmp(name, "--fork-workers")) fork_workers = atol(NEXT());
     else if (!strcmp(name, "--fork-reinit")) fork_reinit = 1;
+    else if (!strcmp(name, "--holder-hang")) g_holder_hang = 1;
+    else if (!strcmp(name, "--hostile")) hostile_mode = NEXT();
+    else if (!strcmp(name, "--noise-procs")) noise_procs = atol(NEXT());
+    else if (!strcmp(name, "--noise-fds")) noise_fds = atol(NEXT());
+    else if (!strcmp(name, "--exec-rate")) exec_rate = atol(NEXT());
+    else if (!strcmp(name, "--noop")) return 0;
     else {
-      fprintf(stderr, "usage: %s [--poll-us N] [--exclusive] [--acquire-ms N] [--exit-after-s N] [--init-delay-ms N]"
-              " [--fork-after-ms N [--fork-workers K] [--fork-reinit]]\n",
-              argv[0]);
+      fprintf(stderr, "usage: %s [--poll-us N] [--exclusive [--acquire-ms N] [--holder-hang]] [--exit-after-s N]"
+              " [--init-delay-ms N] [--fork-after-ms N [--fork-workers K] [--fork-reinit]]\n"
+              "       %s --hostile=MODE\n"
+              "       %s --noise-procs=N [--noise-fds=M] [--exec-rate=R]\n",
+              argv[0], argv[0], argv[0]);
       return 2;
     }
 #undef NEXT
@@ -186,6 +324,8 @@ int main(int argc, char **argv) {
   g_st.start_time = self_start_time();
   g_st.mode = exclusive ? TESTCLIENT_MODE_EXCLUSIVE : 0;
   memset(g_token_id, 0x77, sizeof g_token_id); /* one node-wide token */
+  if (hostile_mode) return hostile(hostile_mode);
+  if (noise_procs > 0 || exec_rate > 0) return noise(noise_procs, noise_fds, exec_rate, "/proc/self/exe");
 
   /* A library that initializes on first use (e.g. on the first CUDA call). */
   uint64_t t_exec = procctl_now_ns();

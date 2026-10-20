@@ -24,6 +24,8 @@ type RegistryOptions struct {
 	Logger         *slog.Logger
 	// ForceProcFallback skips pidfd_getfd and opens /proc/<pid>/fd/<n>.
 	ForceProcFallback bool
+	// ForceMemFallback reads state blocks through /proc/<pid>/mem.
+	ForceMemFallback bool
 	// OnReject, if set, is called for every region that fails attach or
 	// validation (SPEC §10.2), e.g. to count rejections by reason.
 	OnReject func(pid, fd int, err error)
@@ -47,17 +49,20 @@ type Event struct {
 // Registry discovers, attaches and maintains regions: it owns them,
 // heartbeats them, and detaches them when their process exits.
 type Registry struct {
-	opt     RegistryOptions
-	id      Identity
-	log     *slog.Logger
-	notify  chan int
-	events  chan Event
-	first   chan struct{}
-	mu      sync.Mutex
-	clients map[Key]*Client
-	byPidfd map[int]*Client
-	epfd    int
-	closed  bool
+	opt    RegistryOptions
+	id     Identity
+	log    *slog.Logger
+	notify chan int
+
+	lastScan  ScanStats
+	fullScans int
+	events    chan Event
+	first     chan struct{}
+	mu        sync.Mutex
+	clients   map[Key]*Client
+	byPidfd   map[int]*Client
+	epfd      int
+	closed    bool
 }
 
 // NewRegistry creates a registry with a fresh agent identity.
@@ -118,6 +123,14 @@ func (r *Registry) Notify(pid int) {
 	}
 }
 
+// LastScan returns the cost of the latest full /proc scan, and how many
+// full scans have run.
+func (r *Registry) LastScan() (ScanStats, int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.lastScan, r.fullScans
+}
+
 // Clients returns the attached clients.
 func (r *Registry) Clients() []*Client {
 	r.mu.Lock()
@@ -168,6 +181,12 @@ func (r *Registry) scan(ctx context.Context, pid int) {
 		return
 	}
 	r.log.Debug("scan", "procs", stats.Procs, "fds", stats.FDs, "took", stats.Duration, "found", len(cands))
+	if pid == 0 {
+		r.mu.Lock()
+		r.lastScan = stats
+		r.fullScans++
+		r.mu.Unlock()
+	}
 	// Several pids can hold one region (fork); prefer the lowest pid.
 	sort.Slice(cands, func(i, j int) bool { return cands[i].HostPID < cands[j].HostPID })
 	for _, cand := range cands {
@@ -183,7 +202,7 @@ func (r *Registry) scan(ctx context.Context, pid int) {
 		c, err := Attach(cand.HostPID, cand.FD, AttachOptions{
 			ProcRoot: r.opt.ProcRoot, MaxRegionSize: r.opt.MaxRegionSize,
 			Identity: r.id, Lease: r.opt.Lease, ReadTimeout: r.opt.ReadTimeout,
-			ForceProcFallback: r.opt.ForceProcFallback,
+			ForceProcFallback: r.opt.ForceProcFallback, ForceMemFallback: r.opt.ForceMemFallback,
 		})
 		if err != nil {
 			r.log.Info("attach rejected", "pid", cand.HostPID, "fd", cand.FD, "err", err)

@@ -184,17 +184,15 @@ func ParseHeader(b []byte, fileSize uint64) (Header, error) {
 	case h.InstanceID == 0:
 		return h, invalid("zero instance_id")
 	}
-	if h.StateAddr != 0 {
-		switch {
-		case h.StateAddr%8 != 0:
-			return h, invalid("state_addr not aligned")
-		case h.StateSize%8 != 0 || h.StateSize < uint32(StateHdrSize) || h.StateSize > MaxStateSize:
-			return h, invalid("bad state_size %d", h.StateSize)
-		case uint32(StateHdrSize)+uint32(h.ResourceSlots)*uint32(resEntrySize) > h.StateSize:
-			return h, invalid("resource table does not fit the state block")
-		}
-	} else if h.StateSize != 0 {
-		return h, invalid("state_size without state_addr")
+	switch {
+	case h.StateAddr == 0:
+		return h, invalid("no state block")
+	case h.StateAddr%8 != 0:
+		return h, invalid("state_addr not aligned")
+	case h.StateSize%8 != 0 || h.StateSize < uint32(StateHdrSize) || h.StateSize > MaxStateSize:
+		return h, invalid("bad state_size %d", h.StateSize)
+	case uint32(StateHdrSize)+uint32(h.ResourceSlots)*uint32(resEntrySize) > h.StateSize:
+		return h, invalid("resource table does not fit the state block")
 	}
 	return h, nil
 }

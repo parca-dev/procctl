@@ -5,6 +5,9 @@ package procctl
 import (
 	"context"
 	"errors"
+	"io"
+	"math"
+	"os"
 	"time"
 	"unsafe"
 
@@ -31,8 +34,6 @@ type State struct {
 }
 
 var (
-	// ErrNoState: the region has no state block.
-	ErrNoState = errors.New("procctl: region has no state block")
 	// ErrStateBusy: the state block kept changing during reads.
 	ErrStateBusy = errors.New("procctl: state block busy")
 	// ErrStateInvalid: the state block failed validation.
@@ -41,12 +42,19 @@ var (
 	ErrTimeout = errors.New("procctl: remote read timed out")
 )
 
-// remoteRead copies len(dst) bytes from addr in process pid.
-func remoteRead(pid int, addr uint64, dst []byte) error {
+// remoteReader reads another process's memory (SPEC §7.3).
+type remoteReader interface {
+	read(addr uint64, dst []byte) error
+}
+
+// vmReader uses process_vm_readv.
+type vmReader struct{ pid int }
+
+func (r vmReader) read(addr uint64, dst []byte) error {
 	local := []unix.Iovec{{Base: &dst[0]}}
 	local[0].SetLen(len(dst))
 	remote := []unix.RemoteIovec{{Base: uintptr(addr), Len: len(dst)}}
-	n, err := unix.ProcessVMReadv(pid, local, remote, 0)
+	n, err := unix.ProcessVMReadv(r.pid, local, remote, 0)
 	if err != nil {
 		return err
 	}
@@ -56,20 +64,38 @@ func remoteRead(pid int, addr uint64, dst []byte) error {
 	return nil
 }
 
-func remoteReadU64(pid int, addr uint64) (uint64, error) {
+// memReader preads /proc/<pid>/mem. The fd is bound to the process's memory
+// when opened, so it can't follow a reused pid.
+type memReader struct{ f *os.File }
+
+func (r memReader) read(addr uint64, dst []byte) error {
+	if addr > math.MaxInt64 {
+		return unix.EFAULT
+	}
+	n, err := r.f.ReadAt(dst, int64(addr))
+	if n == len(dst) {
+		return nil
+	}
+	if err == nil || errors.Is(err, io.EOF) {
+		err = unix.EFAULT
+	}
+	return err
+}
+
+func remoteReadU64(r remoteReader, addr uint64) (uint64, error) {
 	var v uint64
 	b := unsafe.Slice((*byte)(unsafe.Pointer(&v)), 8)
-	if err := remoteRead(pid, addr, b); err != nil {
+	if err := r.read(addr, b); err != nil {
 		return 0, err
 	}
 	return le.Uint64(b), nil
 }
 
 // readStateOnce performs the SPEC §7.3 procedure once.
-func readStateOnce(pid int, h *Header, innermostNSPid int) (State, error) {
+func readStateOnce(r remoteReader, h *Header, innermostNSPid int) (State, error) {
 	var st State
 	seqAddr := h.StateAddr + uint64(stateSeqOff)
-	s1, err := remoteReadU64(pid, seqAddr)
+	s1, err := remoteReadU64(r, seqAddr)
 	if err != nil {
 		return st, err
 	}
@@ -77,10 +103,10 @@ func readStateOnce(pid int, h *Header, innermostNSPid int) (State, error) {
 		return st, ErrStateBusy
 	}
 	buf := make([]byte, h.StateSize)
-	if err := remoteRead(pid, h.StateAddr, buf); err != nil {
+	if err := r.read(h.StateAddr, buf); err != nil {
 		return st, err
 	}
-	s2, err := remoteReadU64(pid, seqAddr)
+	s2, err := remoteReadU64(r, seqAddr)
 	if err != nil {
 		return st, err
 	}
@@ -139,10 +165,7 @@ func parseState(buf []byte, h *Header, innermostNSPid int) (State, error) {
 
 // readState retries readStateOnce under a deadline. A read that is still
 // blocked when ctx expires is abandoned (its goroutine finishes on its own).
-func readState(ctx context.Context, pid int, h *Header, innermost int, timeout time.Duration) (State, error) {
-	if h.StateAddr == 0 {
-		return State{}, ErrNoState
-	}
+func readState(ctx context.Context, rd remoteReader, h *Header, innermost int, timeout time.Duration) (State, error) {
 	if _, ok := ctx.Deadline(); !ok && timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, timeout)
@@ -156,7 +179,7 @@ func readState(ctx context.Context, pid int, h *Header, innermost int, timeout t
 	go func() {
 		var r result
 		for tries := 0; tries < 8; tries++ {
-			r.st, r.err = readStateOnce(pid, h, innermost)
+			r.st, r.err = readStateOnce(rd, h, innermost)
 			if !errors.Is(r.err, ErrStateBusy) {
 				break
 			}

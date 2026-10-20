@@ -50,6 +50,8 @@ var (
 	hold          = flag.Duration("hold", 2*time.Second, "exclusive: per-turn hold time")
 	deadline      = flag.Duration("deadline", 6*time.Second, "exclusive: grant duration")
 	procFallback  = flag.Bool("force-proc-fallback", false, "attach via /proc/<pid>/fd instead of pidfd_getfd")
+	memFallback   = flag.Bool("force-mem-fallback", false, "read state via /proc/<pid>/mem instead of process_vm_readv")
+	wakeProbe     = flag.Duration("wake-probe", 0, "if > 0 (and not --exclusive): this often, rewrite each --exclusive client's grant table and time until its state shows grants_seen_gen (S16)")
 	uninstall     = flag.Bool("uninstall", false, "on exit, clear ownership so clients revert immediately")
 	debug         = flag.Bool("debug", false, "debug logging")
 	useHello      = flag.Bool("hello", true, "fast discovery: hello-probe uprobes and mapping events (falls back to scan-only)")
@@ -71,6 +73,12 @@ type tracked struct {
 	haveState bool
 	stale     bool
 	ackedGen  uint64
+	owned     bool
+	ownSeen   bool
+	ownFlips  int             // ownership changes after attach (S13)
+	wake      []time.Duration // --wake-probe latencies (ring buffer)
+	wakeNext  int
+	wakeFails int
 }
 
 type agent struct {
@@ -96,7 +104,7 @@ func main() {
 	a := &agent{log: log, clients: map[procctl.Key]*tracked{}, rejected: map[string]int{}, start: time.Now()}
 	reg, err := procctl.NewRegistry(procctl.RegistryOptions{
 		Consumer: consumerName, RescanInterval: *rescan, Lease: *lease, Logger: log,
-		ForceProcFallback: *procFallback,
+		ForceProcFallback: *procFallback, ForceMemFallback: *memFallback,
 		OnReject: func(pid, fd int, err error) {
 			a.mu.Lock()
 			a.rejected[reasonOf(err)]++
@@ -136,6 +144,9 @@ func main() {
 		go func() { _ = a.arb.Run(ctx) }()
 	}
 
+	if *wakeProbe > 0 && !*useExclusive {
+		go a.wakeLoop(ctx)
+	}
 	writeTick := time.NewTicker(time.Duration(float64(time.Second) / *rate))
 	readTick := time.NewTicker(*readInterval)
 	sumTick := time.NewTicker(*summaryEvery)
@@ -252,6 +263,12 @@ func (a *agent) readAll(ctx context.Context) {
 		}
 		t.stale = st.Stale
 		t.ackedGen = st.AppliedGen
+		if o := t.c.Owned(); !t.ownSeen || o != t.owned {
+			if t.ownSeen {
+				t.ownFlips++
+			}
+			t.owned, t.ownSeen = o, true
+		}
 		if !st.Stale && len(st.Consumer) >= int(unsafe.Sizeof(clientStatus{})) {
 			var cs clientStatus
 			if binary.Read(bytes.NewReader(st.Consumer), binary.LittleEndian, &cs) == nil {
@@ -273,6 +290,55 @@ func (a *agent) readAll(ctx context.Context) {
 	}
 }
 
+// wakeLoop measures S16: agent write → the client's control thread wakes
+// (futex on the read-only mapping) → its state shows grants_seen_gen.
+func (a *agent) wakeLoop(ctx context.Context) {
+	tick := time.NewTicker(*wakeProbe)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		}
+		for _, t := range a.snapshot() {
+			a.mu.Lock()
+			excl := t.haveState && t.status.Mode&modeExclusive != 0
+			a.mu.Unlock()
+			if !excl || !t.c.Owned() {
+				continue
+			}
+			d, ok := measureWake(ctx, t.c)
+			a.mu.Lock()
+			if !ok {
+				t.wakeFails++
+			} else if len(t.wake) < latencyWindow {
+				t.wake = append(t.wake, d)
+			} else {
+				t.wake[t.wakeNext] = d
+				t.wakeNext = (t.wakeNext + 1) % latencyWindow
+			}
+			a.mu.Unlock()
+		}
+	}
+}
+
+func measureWake(ctx context.Context, c *procctl.Client) (time.Duration, bool) {
+	gen, _, err := c.WriteGrants(nil)
+	if err != nil {
+		return 0, false
+	}
+	start := time.Now()
+	for time.Since(start) < 500*time.Millisecond {
+		st, err := c.ReadState(ctx)
+		if err == nil && !st.Stale && st.GrantsSeenGen >= gen {
+			return time.Since(start), true
+		}
+		time.Sleep(200 * time.Microsecond)
+	}
+	return 0, false
+}
+
 // ---- summary -------------------------------------------------------------------
 
 type clientSummary struct {
@@ -284,6 +350,12 @@ type clientSummary struct {
 	HostStart    uint64  `json:"host_start_time"` // /proc/<host_pid>/stat as the agent sees it
 	Owned        bool    `json:"owned"`
 	Path         string  `json:"path"`
+	ReadPath     string  `json:"read_path"`
+	OwnFlips     int     `json:"own_changes"`
+	WakeP50us    float64 `json:"wake_p50_us"`
+	WakeP99us    float64 `json:"wake_p99_us"`
+	WakeSamples  int     `json:"wake_samples"`
+	WakeFails    int     `json:"wake_fails"`
 	Stale        bool    `json:"stale"`
 	AckedGen     uint64  `json:"acked_gen"`
 	LastTag      uint64  `json:"last_tag"`
@@ -300,6 +372,13 @@ type clientSummary struct {
 	Releases     uint64  `json:"releases"`
 	WriteErrs    uint64  `json:"write_errs"`
 	ReadErrs     uint64  `json:"read_errs"`
+}
+
+type scanSummary struct {
+	Procs int     `json:"procs"`
+	FDs   int     `json:"fds"`
+	MS    float64 `json:"ms"`
+	Count int     `json:"count"`
 }
 
 type resourceSummary struct {
@@ -324,6 +403,7 @@ type summary struct {
 	Mapped    int               `json:"mapped_regions"` // procctl memfds mapped in this agent
 	CPUS      float64           `json:"cpu_s"`
 	Discovery string            `json:"discovery"`
+	Scan      scanSummary       `json:"scan"`
 	Hello     *hello.Stats      `json:"hello,omitempty"`
 	Clients   []clientSummary   `json:"clients"`
 	Resources []resourceSummary `json:"resources,omitempty"`
@@ -351,6 +431,9 @@ func (a *agent) summary() {
 		CPUS:      time.Duration(ru.Utime.Nano() + ru.Stime.Nano()).Seconds(),
 		Discovery: a.mode,
 	}
+	if st, n := a.reg.LastScan(); n > 0 {
+		s.Scan = scanSummary{Procs: st.Procs, FDs: st.FDs, MS: float64(st.Duration.Microseconds()) / 1000, Count: n}
+	}
 	if a.hello != nil {
 		st := a.hello.Stats()
 		s.Hello = &st
@@ -368,6 +451,8 @@ func (a *agent) summary() {
 		info := t.c.Info()
 		cs := clientSummary{
 			HostPID: info.HostPID, NSPid: info.NSPid, Owned: t.c.Owned(), Path: info.AttachPath,
+			ReadPath: info.ReadPath, OwnFlips: t.ownFlips, WakeFails: t.wakeFails,
+			WakeP50us: pct(t.wake, 0.50), WakeP99us: pct(t.wake, 0.99), WakeSamples: len(t.wake),
 			Stale: t.stale, AckedGen: t.ackedGen, WriteErrs: t.writeErrs, ReadErrs: t.readErrs,
 			LatP50us: pct(t.latencies, 0.50), LatP99us: pct(t.latencies, 0.99), Samples: len(t.latencies),
 			HostStart: hostStartTime(info.HostPID),

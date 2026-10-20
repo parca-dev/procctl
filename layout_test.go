@@ -43,7 +43,7 @@ func TestParseHeaderRejects(t *testing.T) {
 		"state unaligned":    func(h *Header, b []byte) []byte { h.StateAddr = 0x1001; return nil },
 		"state too small":    func(h *Header, b []byte) []byte { h.StateSize = 64; return nil },
 		"state too large":    func(h *Header, b []byte) []byte { h.StateSize = 70000; return nil },
-		"size w/o addr":      func(h *Header, b []byte) []byte { h.StateAddr = 0; return nil },
+		"no state block":     func(h *Header, b []byte) []byte { h.StateAddr = 0; return nil },
 		"consumer chars":     func(h *Header, b []byte) []byte { h.Consumer = "Echo"; return nil },
 		"empty consumer":     func(h *Header, b []byte) []byte { h.Consumer = ""; return nil },
 		"zero instance":      func(h *Header, b []byte) []byte { h.InstanceID = 0; return nil },

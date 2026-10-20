@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -151,6 +152,12 @@ type clientSummary struct {
 	HostStart    uint64  `json:"host_start_time"`
 	Owned        bool    `json:"owned"`
 	Path         string  `json:"path"`
+	ReadPath     string  `json:"read_path"`
+	OwnChanges   int     `json:"own_changes"`
+	WakeP50us    float64 `json:"wake_p50_us"`
+	WakeP99us    float64 `json:"wake_p99_us"`
+	WakeSamples  int     `json:"wake_samples"`
+	WakeFails    int     `json:"wake_fails"`
 	Stale        bool    `json:"stale"`
 	AckedGen     uint64  `json:"acked_gen"`
 	LastTag      uint64  `json:"last_tag"`
@@ -183,7 +190,13 @@ type summary struct {
 	Mapped    int            `json:"mapped_regions"`
 	CPUS      float64        `json:"cpu_s"`
 	Discovery string         `json:"discovery"`
-	Hello     *struct {
+	Scan      struct {
+		Procs int     `json:"procs"`
+		FDs   int     `json:"fds"`
+		MS    float64 `json:"ms"`
+		Count int     `json:"count"`
+	} `json:"scan"`
+	Hello *struct {
 		FilesInspected, FilesWithHello, Uprobes, UprobesActive, FilesCached, UprobeErrors, Firings, MappingEvents, LostEvents, InspectFailures uint64
 	} `json:"hello"`
 	Clients   []clientSummary `json:"clients"`
@@ -197,11 +210,14 @@ type summary struct {
 }
 
 // latestSummary returns the newest summary line of the agent pod(s).
-func latestSummary(t *testing.T) (summary, bool) {
+func latestSummary(t *testing.T) (summary, bool) { return latestSummaryOf(t, agentDS) }
+
+// latestSummaryOf returns the newest summary of the agent DaemonSet app.
+func latestSummaryOf(t *testing.T, app string) (summary, bool) {
 	t.Helper()
 	var best summary
 	found := false
-	for _, p := range pods(t, agentNS, "app="+agentDS) {
+	for _, p := range pods(t, agentNS, "app="+app) {
 		out, err := kubectlErr("-n", agentNS, "logs", p, "--tail=50")
 		if err != nil {
 			continue
@@ -225,10 +241,15 @@ func latestSummary(t *testing.T) (summary, bool) {
 // waitSummary polls until pred holds for the latest summary.
 func waitSummary(t *testing.T, timeout time.Duration, what string, pred func(summary) bool) summary {
 	t.Helper()
+	return waitSummaryOf(t, agentDS, timeout, what, pred)
+}
+
+func waitSummaryOf(t *testing.T, app string, timeout time.Duration, what string, pred func(summary) bool) summary {
+	t.Helper()
 	deadline := time.Now().Add(timeout)
 	var last summary
 	for time.Now().Before(deadline) {
-		if s, ok := latestSummary(t); ok {
+		if s, ok := latestSummaryOf(t, app); ok {
 			last = s
 			if pred(s) {
 				return s
@@ -237,7 +258,7 @@ func waitSummary(t *testing.T, timeout time.Duration, what string, pred func(sum
 		time.Sleep(time.Second)
 	}
 	b, _ := json.MarshalIndent(last, "", "  ")
-	t.Fatalf("timed out after %v waiting for %s; last summary:\n%s", timeout, what, b)
+	t.Fatalf("timed out after %v waiting for %s (%s); last summary:\n%s", timeout, what, app, b)
 	return last
 }
 
@@ -319,6 +340,8 @@ type clientEvent struct {
 	SinceStartMS float64 `json:"since_start_ms"`
 	Reinit       *int    `json:"reinit"`
 	InheritedAck int     `json:"inherited_ack"`
+	Mode         string  `json:"mode"`
+	Total        uint64  `json:"total"`
 }
 
 func clientEvents(t *testing.T, pod string) []clientEvent {
@@ -332,6 +355,33 @@ func clientEvents(t *testing.T, pod string) []clientEvent {
 		var e clientEvent
 		if json.Unmarshal([]byte(line), &e) == nil && e.Ev != "" {
 			evs = append(evs, e)
+		}
+	}
+	return evs
+}
+
+// allClientEvents also includes the previous container's log (a client
+// killed and restarted in place).
+func allClientEvents(t *testing.T, pod string) []clientEvent {
+	t.Helper()
+	var evs []clientEvent
+	for _, prev := range []bool{true, false} {
+		args := []string{"-n", clientNS, "logs", pod}
+		if prev {
+			args = append(args, "--previous")
+		}
+		out, err := kubectlErr(args...)
+		if err != nil {
+			if prev {
+				continue
+			}
+			t.Fatalf("logs %s: %v", pod, err)
+		}
+		for _, line := range strings.Split(out, "\n") {
+			var e clientEvent
+			if json.Unmarshal([]byte(line), &e) == nil && e.Ev != "" {
+				evs = append(evs, e)
+			}
 		}
 	}
 	return evs
@@ -360,6 +410,92 @@ func nodeExec(t *testing.T, node string, args ...string) string {
 		t.Fatalf("docker exec %s %v: %v\n%s", node, args, err, out)
 	}
 	return string(out)
+}
+
+// ---- variants -------------------------------------------------------------------
+
+// variantDoc renders the base client Deployment (or agent DaemonSet) under
+// another name and app label.
+func variantDoc(t *testing.T, ns, kind, base, name string) string {
+	t.Helper()
+	for _, doc := range strings.Split(part(manifests(t), ns), "\n---\n") {
+		if strings.Contains(doc, "kind: "+kind+"\n") {
+			doc = strings.ReplaceAll(doc, "name: "+base+"\n", "name: "+name+"\n")
+			return strings.ReplaceAll(doc, "app: "+base+"\n", "app: "+name+"\n")
+		}
+	}
+	t.Fatalf("no %s in the %s manifests", kind, ns)
+	return ""
+}
+
+func nsDoc(t *testing.T, ns string) string {
+	t.Helper()
+	return strings.Split(part(manifests(t), ns), "\n---\n")[0]
+}
+
+// deployVariant runs replicas of the test client as a Deployment of its own,
+// with args and optional strategic-merge patches. It returns the running pods,
+// or the error if the rollout fails.
+func deployVariant(t *testing.T, name string, replicas int, args []string, patches ...string) ([]string, error) {
+	t.Helper()
+	return deployVariantWithin(t, 180*time.Second, name, replicas, args, patches...)
+}
+
+func deployVariantWithin(t *testing.T, timeout time.Duration, name string, replicas int, args []string, patches ...string) ([]string, error) {
+	t.Helper()
+	apply(t, nsDoc(t, clientNS))
+	// Created with no replicas, so nothing runs before args and patches apply.
+	doc := regexp.MustCompile(`(?m)^  replicas: \d+$`).ReplaceAllString(variantDoc(t, clientNS, "Deployment", clientDP, name), "  replicas: 0")
+	apply(t, doc)
+	obj := "deployment/" + name
+	setArgs(t, clientNS, obj, args)
+	for _, p := range patches {
+		kubectl(t, "-n", clientNS, "patch", obj, "-p", p)
+	}
+	kubectl(t, "-n", clientNS, "scale", obj, fmt.Sprintf("--replicas=%d", replicas))
+	if out, err := kubectlErr("-n", clientNS, "rollout", "status", obj, fmt.Sprintf("--timeout=%ds", int(timeout.Seconds()))); err != nil {
+		return nil, fmt.Errorf("%v: %s", err, out)
+	}
+	return pods(t, clientNS, "app="+name), nil
+}
+
+// deployAgentVariant runs another agent DaemonSet (S13).
+func deployAgentVariant(t *testing.T, name string, args ...string) {
+	t.Helper()
+	apply(t, variantDoc(t, agentNS, "DaemonSet", agentDS, name))
+	if len(args) > 0 {
+		setArgs(t, agentNS, "daemonset/"+name, args)
+	}
+	kubectl(t, "-n", agentNS, "rollout", "status", "daemonset/"+name, "--timeout=120s")
+}
+
+// restarts sums the container restarts of the pods matching label.
+func restarts(t *testing.T, ns, label string) int {
+	t.Helper()
+	out := kubectl(t, "-n", ns, "get", "pods", "-l", label, "-o",
+		"jsonpath={range .items[*]}{.status.containerStatuses[*].restartCount}{\" \"}{end}")
+	n := 0
+	for _, f := range strings.Fields(out) {
+		v, _ := strconv.Atoi(f)
+		n += v
+	}
+	return n
+}
+
+// hostPIDOf returns the host pid the agent reports for a client pod.
+func hostPIDOf(t *testing.T, s summary, pod string) int {
+	t.Helper()
+	c, ok := byPod(s)[pod]
+	if !ok {
+		t.Fatalf("%s is not attached", pod)
+	}
+	return c.HostPID
+}
+
+// signal sends sig to a host pid on the kind node.
+func signal(t *testing.T, node string, sig string, pid int) {
+	t.Helper()
+	nodeExec(t, node, "kill", "-"+sig, strconv.Itoa(pid))
 }
 
 func getenv(k, def string) string {

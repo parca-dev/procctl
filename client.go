@@ -43,12 +43,16 @@ func NewIdentity() (Identity, error) {
 
 // AttachOptions configures Attach.
 type AttachOptions struct {
-	ProcRoot          string        // default "/proc"
-	MaxRegionSize     int64         // default 4 MiB
-	ForceProcFallback bool          // skip pidfd_getfd; open /proc/<pid>/fd/<n>
-	Identity          Identity      // required
-	Lease             time.Duration // lease_ns written on claim; 0 = no lease
-	ReadTimeout       time.Duration // remote state reads; default 1s
+	ProcRoot          string // default "/proc"
+	MaxRegionSize     int64  // default 4 MiB
+	ForceProcFallback bool   // skip pidfd_getfd; open /proc/<pid>/fd/<n>
+	// ForceMemFallback reads state blocks with pread on /proc/<pid>/mem
+	// instead of process_vm_readv. Attach also falls back by itself when
+	// process_vm_readv is refused (ENOSYS, EPERM: e.g. seccomp).
+	ForceMemFallback bool
+	Identity         Identity      // required
+	Lease            time.Duration // lease_ns written on claim; 0 = no lease
+	ReadTimeout      time.Duration // remote state reads; default 1s
 }
 
 // Info describes an attached region.
@@ -58,6 +62,7 @@ type Info struct {
 	NSPid         []int
 	Header        Header
 	AttachPath    string // "pidfd_getfd" or "proc"
+	ReadPath      string // "process_vm_readv" or "proc_mem"
 	PayloadCap    int
 	ResourceSlots int
 }
@@ -68,6 +73,7 @@ type Client struct {
 	info     Info
 	area     area
 	pidfd    int
+	rd       remoteReader
 	opt      AttachOptions
 	owned    bool
 	closed   bool
@@ -207,6 +213,11 @@ func Attach(pid, fd int, opt AttachOptions) (*Client, error) {
 		unix.Munmap(mem)
 		return nil, err
 	}
+	rd, readPath, err := openReader(opt, pid, h.StateAddr)
+	if err != nil {
+		unix.Munmap(mem)
+		return nil, err
+	}
 	c := &Client{
 		info: Info{
 			Key:           Key{Dev: uint64(st.Dev), Ino: st.Ino},
@@ -214,16 +225,35 @@ func Attach(pid, fd int, opt AttachOptions) (*Client, error) {
 			NSPid:         ns,
 			Header:        h,
 			AttachPath:    path,
+			ReadPath:      readPath,
 			PayloadCap:    h.PayloadCapacity(),
 			ResourceSlots: int(h.ResourceSlots),
 		},
 		area:  area{mem: mem, body: mem[h.AreaOff:], slots: int(h.ResourceSlots)},
 		pidfd: pidfd,
+		rd:    rd,
 		opt:   opt,
 		done:  make(chan struct{}),
 	}
 	ok = true
 	return c, nil
+}
+
+// openReader picks how the state block is read: process_vm_readv, unless it
+// is forced off or refused, then /proc/<pid>/mem.
+func openReader(opt AttachOptions, pid int, stateAddr uint64) (remoteReader, string, error) {
+	if !opt.ForceMemFallback {
+		var b [8]byte
+		err := vmReader{pid}.read(stateAddr, b[:])
+		if !errors.Is(err, unix.ENOSYS) && !errors.Is(err, unix.EPERM) {
+			return vmReader{pid}, "process_vm_readv", nil // other errors are the process's problem
+		}
+	}
+	f, err := os.Open(fmt.Sprintf("%s/%d/mem", opt.ProcRoot, pid))
+	if err != nil {
+		return nil, "", fmt.Errorf("open /proc/<pid>/mem: %w", err)
+	}
+	return memReader{f}, "proc_mem", nil
 }
 
 // parseMemfdName parses "/memfd:procctl:<consumer>-v<major>[ (deleted)]".
@@ -434,7 +464,7 @@ func (c *Client) ReadState(ctx context.Context) (State, error) {
 	default:
 	}
 	ns := c.info.NSPid
-	return readState(ctx, c.info.HostPID, &c.info.Header, ns[len(ns)-1], c.opt.ReadTimeout)
+	return readState(ctx, c.rd, &c.info.Header, ns[len(ns)-1], c.opt.ReadTimeout)
 }
 
 // WaitAck waits until the process acknowledges generation gen (SPEC §8.2).
@@ -487,6 +517,9 @@ func (c *Client) Close() error {
 	c.closed = true
 	c.markDone()
 	unix.Munmap(c.area.mem)
+	if m, ok := c.rd.(memReader); ok {
+		m.f.Close()
+	}
 	return unix.Close(c.pidfd)
 }
 

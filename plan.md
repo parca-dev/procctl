@@ -531,6 +531,23 @@ Durations assume 1 engineer and are rough.
 - **Phase 2 done:** fast discovery: `hello/` (USDT + uprobes, pid-namespace translation, GC), `internal/perfsideband` (mmap2), and S1 + S7 on kind.
   - S1: init → first apply in ~20–100 ms, whether init runs at exec or 2 s later. The rescan is effectively off, and the first apply waits for the agent's 10 Hz write cadence.
   - S7: 2 parents + 16 reinit children all attached, ~70–100 ms. Inherited-state children are never attached, and their writes are refused with `-ECHILD`.
+- **Phase 3 done:** the remaining scenarios on kind. Results:
+  - **S8:** all 12 hostile modes behave as expected. 9 are rejected, each for its own reason, including `no-state`: a state block is mandatory. `bad-state-addr` and `state-never-even` are attached but isolated (their state reads fail). `spoof-pid` is attached under its real pid (S15 holds). The agent never restarts, and well-behaved clients are unaffected.
+  - **S9:** 1,000 processes × 200 fds (reduced scale): a full scan of ~1.1k processes and 205k fds takes ~0.75 s. During a ~440 exec/s storm, new clients are found in < 100 ms. Agent CPU is ~29% of a core, mostly from the test's 5 s rescan.
+  - **S10:** skipped on kind. runc can't mount sysfs for a `hostUsers: false` pod inside the node container, so this waits for M4. PSA restricted and RuntimeDefault are covered by the base manifests.
+  - **S11:** all 4 combinations of attach path (`pidfd_getfd` or `/proc/<pid>/fd`) and read path (`process_vm_readv` or `/proc/<pid>/mem`) pass. `/proc/<pid>/mem` is new: forced with `ForceMemFallback`, or chosen automatically when `process_vm_readv` is refused (ENOSYS, EPERM).
+  - **S12:** degradation without crashes. Without SYS_ADMIN, discovery is `mmap-only`; without BPF/PERFMON, `scan-only`; without SYS_PTRACE, nothing attaches and clients run on their defaults. gVisor and Autopilot wait for M4.
+  - **S13:** with two agents, there are zero ownership changes while healthy. A stopped owner is taken over in ~4.3 s (lease 3 s), and a resumed owner stays out. A killed owner is replaced in ~1.5 s, and the restarted one stays out.
+  - **S14:** no overlapping holding intervals, judged from the clients' own logs, across:
+    - round-robin turns;
+    - a killed holder (re-granted in ~4 ms);
+    - a stopped holder (no re-grant while it lives; blocked time reported; it self-releases on resume);
+    - a hung control thread (`--holder-hang`: no re-grant, blocked time reported; re-granted ~100 ms after it is killed);
+    - 3 agent kills and a rolling update;
+    - a lone holder (renewed, never released).
+
+    `--no-ctl-thread` isn't implemented yet.
+  - **S16:** from agent write to the client's state showing `grants_seen_gen`: p50 ~0.9 ms, p99 ~1.4 ms.
 
 - **Images and manifests:** testclient and testagent (§6); `deploy/` overlays.
 - **The suite:** S1–S16 on kind, with S9 at reduced scale and S12 as far as kind allows.
