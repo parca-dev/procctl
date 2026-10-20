@@ -73,8 +73,8 @@ func TestS3AgentRestartAndRollingUpdate(t *testing.T) {
 		before := expiries()
 		started := time.Now()
 		step.do()
-		kubectl(t, "-n", e.agentNS, "rollout", "status", "daemonset/"+agentDS, "--timeout=120s")
-		s := e.wait(60*time.Second, step.name+": new agent attached and acking", func(s summary) bool {
+		kubectl(t, "-n", e.agentNS, "rollout", "status", "daemonset/"+agentDS, "--timeout=180s")
+		s := e.wait(120*time.Second, step.name+": new agent attached and acking", func(s summary) bool {
 			return s.AgentPID != prev.AgentPID && allAttached(want)(s)
 		})
 		checkHealthy(t, s)

@@ -36,7 +36,9 @@ func TestS9ScanCost(t *testing.T) {
 		return s.Scan.Count > base.Scan.Count && s.Scan.Procs >= base.Scan.Procs+procs && s.Scan.FDs >= procs*fds
 	})
 	t.Logf("full /proc scan: %d processes, %d fds in %.0f ms (agent rss %d KiB)", s.Scan.Procs, s.Scan.FDs, s.Scan.MS, s.RSSKB)
-	if limit := float64(procs); s.Scan.MS > limit { // ~1 ms per process with 200 fds
+	// Recorded; the bound only catches a runaway (0.4–2.7 ms per process
+	// with 200 fds, depending on how busy the host is).
+	if limit := 5 * float64(procs); s.Scan.MS > limit {
 		t.Errorf("full scan took %.0f ms (limit %.0f)", s.Scan.MS, limit)
 	}
 	checkHealthy(t, s)
@@ -62,8 +64,12 @@ func TestS9ScanCost(t *testing.T) {
 	if s.Hello != nil && before.Hello != nil {
 		events = s.Hello.MappingEvents - before.Hello.MappingEvents
 	}
-	t.Logf("exec storm: ~%.0f exec/s, %d mapping events; agent cpu %.1f%% of a core (incl. the 5 s rescan), rss %d KiB",
-		float64(execs)/elapsed, events, 100*cpu, s.RSSKB)
+	var lost uint64
+	if s.Hello != nil {
+		lost = s.Hello.LostEvents
+	}
+	t.Logf("exec storm: ~%.0f exec/s, %d mapping events (%d lost); agent cpu %.1f%% of a core (incl. the 5 s rescan), rss %d KiB",
+		float64(execs)/elapsed, events, lost, 100*cpu, s.RSSKB)
 	if cpu > 1 {
 		t.Errorf("agent used %.0f%% of a core during the exec storm", 100*cpu)
 	}

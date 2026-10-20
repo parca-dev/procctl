@@ -61,7 +61,7 @@ func TestS13TwoAgents(t *testing.T) {
 	killed := time.Now()
 	e.wait(20*time.Second, "A took over from the killed B", ownsAll(want))
 	t.Logf("B killed: A owns all %v later", time.Since(killed).Round(100*time.Millisecond))
-	e.waitOf(agentB, 60*time.Second, "B restarted", func(s summary) bool { return s.AgentPID != b2.AgentPID })
+	e.waitOf(agentB, 120*time.Second, "B restarted (kubelet restart)", func(s summary) bool { return s.AgentPID != b2.AgentPID })
 	time.Sleep(stable)
 	a, _ = e.latest()
 	b, _ = e.latestOf(agentB)

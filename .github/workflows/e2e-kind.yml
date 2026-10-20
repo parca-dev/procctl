@@ -3,7 +3,8 @@ name: e2e-kind
 # The end-to-end scenarios (plan §7) on a single-node kind cluster:
 # {amd64, arm64} × {oldest supported, latest} Kubernetes. Scenarios run in
 # parallel, each with its own namespaces and consumer; the full-size variants
-# (E2E_LONG) run nightly.
+# (E2E_LONG) run nightly. 4 at a time: 4-core runners; pod starts slow down
+# beyond leases with more.
 
 on:
   pull_request:
@@ -58,7 +59,7 @@ jobs:
           mkdir -p artifacts
           cd e2e
           set -o pipefail
-          go test -count=1 -timeout 20m -parallel 8 -v ./... 2>&1 | tee ../artifacts/e2e.log
+          go test -count=1 -timeout 20m -parallel 4 -v ./... 2>&1 | tee ../artifacts/e2e.log
       - name: Summary
         if: always()
         run: |
