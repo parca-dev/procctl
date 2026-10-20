@@ -77,7 +77,8 @@ images:
 	docker build -f cmd/procctl-testagent/Dockerfile -t procctl-testagent:dev .
 
 # The e2e suite on a kind cluster named procctl-e2e (created if needed;
-# E2E_KEEP_CLUSTER=1 keeps it afterwards).
+# E2E_KEEP_CLUSTER=1 keeps it afterwards; E2E_KIND_IMAGE=kindest/node:v1.35.0
+# picks the Kubernetes version of a new one). CI: .github/workflows/e2e-kind.yml.
 e2e-kind: images
 	cd e2e && go test -count=1 -timeout 45m -v ./...
 

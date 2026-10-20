@@ -9,7 +9,9 @@
 //	go test ./... -v                          # kind
 //	go test ./... -v -args -kubeconfig ~/.kube/config -image-registry ghcr.io/me -image-tag sha
 //
-// Set E2E_KEEP_CLUSTER=1 to keep the kind cluster afterwards.
+// Set E2E_KEEP_CLUSTER=1 to keep the kind cluster afterwards, and
+// E2E_KIND_IMAGE (e.g. kindest/node:v1.35.0) to pick the node image of a new
+// one (default: the kind release's own).
 package e2e
 
 import (
@@ -22,6 +24,7 @@ import (
 	"sigs.k8s.io/e2e-framework/pkg/env"
 	"sigs.k8s.io/e2e-framework/pkg/envconf"
 	"sigs.k8s.io/e2e-framework/pkg/envfuncs"
+	"sigs.k8s.io/e2e-framework/support"
 	"sigs.k8s.io/e2e-framework/support/kind"
 )
 
@@ -45,7 +48,7 @@ func TestMain(m *testing.M) {
 	if cfg.KubeconfigFile() == "" {
 		onKind = true
 		testenv.Setup(
-			envfuncs.CreateCluster(kind.NewProvider(), kindCluster),
+			envfuncs.CreateClusterWithOpts(kind.NewProvider(), kindCluster, kindOpts()...),
 			envfuncs.LoadImageToCluster(kindCluster, "procctl-testagent:dev"),
 			envfuncs.LoadImageToCluster(kindCluster, "procctl-testclient:dev"),
 		)
@@ -58,4 +61,11 @@ func TestMain(m *testing.M) {
 		return ctx, nil
 	})
 	os.Exit(testenv.Run(m))
+}
+
+func kindOpts() []support.ClusterOpts {
+	if img := os.Getenv("E2E_KIND_IMAGE"); img != "" {
+		return []support.ClusterOpts{kind.WithImage(img)}
+	}
+	return nil
 }

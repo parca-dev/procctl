@@ -1,0 +1,77 @@
+name: e2e-kind
+
+# The end-to-end scenarios (plan §7) on a single-node kind cluster:
+# {amd64, arm64} × {oldest supported, latest} Kubernetes.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-kind-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  KIND_VERSION: v0.33.0
+
+jobs:
+  e2e:
+    name: e2e (${{ matrix.arch }}, k8s ${{ matrix.k8s }})
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+        k8s: [v1.35.0, v1.37.0]
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: e2e/go.mod
+          cache-dependency-path: |
+            go.sum
+            e2e/go.sum
+      - name: Install kind
+        run: go install sigs.k8s.io/kind@${KIND_VERSION}
+      - name: Kernel and feature report
+        run: make kernel-report
+      - name: Build the test images
+        run: make images
+      - name: Scenarios S1–S16
+        env:
+          E2E_KIND_IMAGE: kindest/node:${{ matrix.k8s }}
+          E2E_KEEP_CLUSTER: "1" # for the logs below; the runner is discarded anyway
+        run: |
+          mkdir -p artifacts
+          cd e2e
+          set -o pipefail
+          go test -count=1 -timeout 45m -v ./... 2>&1 | tee ../artifacts/e2e.log
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### e2e (${{ matrix.arch }}, k8s ${{ matrix.k8s }})"
+            echo '```'
+            grep -E '^(--- |    --- |ok|FAIL|PASS)|^    [a-z_]+_test\.go:[0-9]+: ' artifacts/e2e.log || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Collect cluster logs
+        if: failure()
+        run: kind export logs artifacts/kind --name procctl-e2e || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-${{ matrix.arch }}-${{ matrix.k8s }}
+          path: artifacts/
+          retention-days: 14

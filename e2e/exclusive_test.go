@@ -130,6 +130,18 @@ func holder(s summary) (string, int) {
 	return "", 0
 }
 
+// liveHolder is holder(s), but only if that process still exists on the node
+// as the same process (start time): a summary can list a just-killed one.
+func liveHolder(t *testing.T, s summary) (string, int) {
+	t.Helper()
+	for _, c := range s.Clients {
+		if c.Holding && sameProcess(s.Node, c.HostPID, c.HostStart) {
+			return c.Pod, c.HostPID
+		}
+	}
+	return "", 0
+}
+
 // holdingNow: by its own log, pod acquired at least minHeld ago and hasn't
 // released since (the agent's summary can be a second old).
 func holdingNow(t *testing.T, pod string, now uint64) bool {
@@ -150,7 +162,7 @@ func waitHolder(t *testing.T, cl []string) (string, int) {
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
 		if s, ok := latestSummary(t); ok && allAttached(t, cl)(s) {
-			if p, pid := holder(s); p != "" && holdingNow(t, p, bootNow(t)) {
+			if p, pid := liveHolder(t, s); p != "" && holdingNow(t, p, bootNow(t)) {
 				return p, pid
 			}
 		}
@@ -276,7 +288,7 @@ func TestS14HungHolder(t *testing.T) {
 	}
 	// SIGKILL it on the node, for a precise end of its interval, then remove it.
 	killed := map[string]uint64{hung[0]: bootNow(t)} // before the signal (see above)
-	signal(t, s.Node, "KILL", hostPIDOf(t, s, hung[0]))
+	signalClient(t, s, hung[0], "KILL")
 	kubectl(t, "-n", clientNS, "scale", "deployment/hang", "--replicas=0")
 	who, at := waitAcquireAfter(t, cl, "", killed[hung[0]], 20*time.Second, "after the hung holder was deleted")
 	t.Logf("hung holder killed: %s acquired %s later", who, ms(at-killed[hung[0]]))

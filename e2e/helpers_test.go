@@ -482,20 +482,36 @@ func restarts(t *testing.T, ns, label string) int {
 	return n
 }
 
-// hostPIDOf returns the host pid the agent reports for a client pod.
-func hostPIDOf(t *testing.T, s summary, pod string) int {
-	t.Helper()
-	c, ok := byPod(s)[pod]
-	if !ok {
-		t.Fatalf("%s is not attached", pod)
+// sameProcess reports whether pid on the node is still the process that
+// started at start (field 22 of /proc/<pid>/stat), not a reused pid.
+func sameProcess(node string, pid int, start uint64) bool {
+	out, err := exec.Command("docker", "exec", node, "cat", fmt.Sprintf("/proc/%d/stat", pid)).Output()
+	if err != nil {
+		return false
 	}
-	return c.HostPID
+	i := bytes.LastIndexByte(out, ')')
+	if i < 0 {
+		return false
+	}
+	f := strings.Fields(string(out[i+1:]))
+	return len(f) >= 20 && f[19] == strconv.FormatUint(start, 10)
 }
 
 // signal sends sig to a host pid on the kind node.
 func signal(t *testing.T, node string, sig string, pid int) {
 	t.Helper()
 	nodeExec(t, node, "kill", "-"+sig, strconv.Itoa(pid))
+}
+
+// signalClient signals the process the agent attached for pod, after checking
+// it is still that process (the pod may have restarted since the summary).
+func signalClient(t *testing.T, s summary, pod, sig string) {
+	t.Helper()
+	c, ok := byPod(s)[pod]
+	if !ok || !sameProcess(s.Node, c.HostPID, c.HostStart) {
+		t.Fatalf("%s: process %d from the summary is gone", pod, c.HostPID)
+	}
+	signal(t, s.Node, sig, c.HostPID)
 }
 
 func getenv(k, def string) string {

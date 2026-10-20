@@ -548,6 +548,7 @@ Durations assume 1 engineer and are rough.
 
     `--no-ctl-thread` isn't implemented yet.
   - **S16:** from agent write to the client's state showing `grants_seen_gen`: p50 ~0.9 ms, p99 ~1.4 ms.
+- **Phase 4:** `.github/workflows/e2e-kind.yml` runs S1–S16 on {amd64, arm64} × Kubernetes {v1.35.0 (oldest supported), v1.37.0} with kind v0.33.0. It runs on PRs, on pushes to main, and on demand. Each job uploads the test log, plus kind's cluster logs on failure, and writes a job summary. The node image is chosen with `E2E_KIND_IMAGE`. Locally, a full run on either version takes 11–13 min.
 
 - **Images and manifests:** testclient and testagent (§6); `deploy/` overlays.
 - **The suite:** S1–S16 on kind, with S9 at reduced scale and S12 as far as kind allows.
