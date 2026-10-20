@@ -148,8 +148,8 @@ static int verify(const uint8_t *b, int n, uint64_t *tag, uint64_t *write_ns) {
 }
 
 int main(int argc, char **argv) {
-  long poll_us = 1000, exit_after_s = 0;
-  int exclusive = 0;
+  long poll_us = 1000, exit_after_s = 0, init_delay_ms = 0, fork_after_ms = 0, fork_workers = 1;
+  int exclusive = 0, fork_reinit = 0;
   for (int i = 1; i < argc; i++) {
     /* Accept both "--opt value" and "--opt=value". */
     char name[64];
@@ -167,8 +167,13 @@ int main(int argc, char **argv) {
     else if (!strcmp(name, "--exclusive")) exclusive = 1;
     else if (!strcmp(name, "--acquire-ms")) g_acquire_ms = atol(NEXT());
     else if (!strcmp(name, "--exit-after-s")) exit_after_s = atol(NEXT());
+    else if (!strcmp(name, "--init-delay-ms")) init_delay_ms = atol(NEXT());
+    else if (!strcmp(name, "--fork-after-ms")) fork_after_ms = atol(NEXT());
+    else if (!strcmp(name, "--fork-workers")) fork_workers = atol(NEXT());
+    else if (!strcmp(name, "--fork-reinit")) fork_reinit = 1;
     else {
-      fprintf(stderr, "usage: %s [--poll-us N] [--exclusive] [--acquire-ms N] [--exit-after-s N]\n",
+      fprintf(stderr, "usage: %s [--poll-us N] [--exclusive] [--acquire-ms N] [--exit-after-s N] [--init-delay-ms N]"
+              " [--fork-after-ms N [--fork-workers K] [--fork-reinit]]\n",
               argv[0]);
       return 2;
     }
@@ -182,6 +187,10 @@ int main(int argc, char **argv) {
   g_st.mode = exclusive ? TESTCLIENT_MODE_EXCLUSIVE : 0;
   memset(g_token_id, 0x77, sizeof g_token_id); /* one node-wide token */
 
+  /* A library that initializes on first use (e.g. on the first CUDA call). */
+  uint64_t t_exec = procctl_now_ns();
+  if (init_delay_ms > 0) usleep((useconds_t)init_delay_ms * 1000);
+
   procctl_config_t cfg = {.consumer = TESTCLIENT_CONSUMER,
                           .schema_version = TESTCLIENT_SCHEMA_VERSION,
                           .payload_capacity = PAYLOAD_CAP,
@@ -194,8 +203,9 @@ int main(int argc, char **argv) {
     return 1;
   }
   uint64_t start = procctl_now_ns();
-  logj("start", "\"start_time\":%llu,\"exclusive\":%d", (unsigned long long)g_st.start_time,
-       exclusive);
+  logj("start", "\"start_time\":%llu,\"exclusive\":%d,\"init_delay_ms\":%ld",
+       (unsigned long long)g_st.start_time, exclusive, init_delay_ms);
+  (void)t_exec;
   pthread_mutex_lock(&g_st_mu);
   publish();
   pthread_mutex_unlock(&g_st_mu);
@@ -206,11 +216,45 @@ int main(int argc, char **argv) {
   }
 
   static uint8_t buf[PAYLOAD_CAP];
-  int was_expired = -1, first = 1;
+  int was_expired = -1, first = 1, forked = 0;
   uint64_t last_publish = 0;
   for (;;) {
     uint64_t now = procctl_now_ns();
     if (exit_after_s && now - start > (uint64_t)exit_after_s * 1000000000ull) break;
+    if (!forked && fork_after_ms > 0 && now - start > (uint64_t)fork_after_ms * 1000000ull) {
+      forked = 1;
+      /* e.g. dataloader workers: children that keep running as clients. */
+      for (long k = 0; k < fork_workers; k++) {
+        /* Hold g_st_mu across fork so the child can't inherit it locked by
+         * the control thread (which doesn't exist in the child). */
+        pthread_mutex_lock(&g_st_mu);
+        pid_t c = fork();
+        if (c == 0) {
+          char parent[64];
+          snprintf(parent, sizeof parent, "%s", (const char *)g_st.pod);
+          int ack = procctl_ack(&g_ctx, 1, 0); /* must be refused: -ECHILD */
+          if (fork_reinit) {
+            int rr = procctl_reinit(&g_ctx); /* own region; fires hello */
+            snprintf((char *)g_st.pod, sizeof g_st.pod, "%.48s-child%ld", parent, k % 1000);
+            g_st.ns_pid = getpid();
+            g_st.start_time = self_start_time();
+            g_st.last_gen = 0;
+            publish();
+            pthread_mutex_unlock(&g_st_mu);
+            logj("forked_child", "\"reinit\":%d,\"inherited_ack\":%d", rr, ack);
+          } else {
+            pthread_mutex_unlock(&g_st_mu);
+            logj("forked_child", "\"reinit\":-1,\"inherited_ack\":%d", ack);
+          }
+          first = 1;
+          was_expired = -1;
+          start = procctl_now_ns();
+          break;
+        }
+        pthread_mutex_unlock(&g_st_mu);
+        logj("forked", "\"child\":%d", c);
+      }
+    }
     uint64_t gen = 0;
     int n = procctl_poll(&g_ctx, buf, sizeof buf, &gen);
     pthread_mutex_lock(&g_st_mu);

@@ -36,6 +36,7 @@ import (
 
 	"github.com/parca-dev/procctl"
 	"github.com/parca-dev/procctl/exclusive"
+	"github.com/parca-dev/procctl/hello"
 )
 
 var (
@@ -50,6 +51,8 @@ var (
 	deadline      = flag.Duration("deadline", 6*time.Second, "exclusive: grant duration")
 	procFallback  = flag.Bool("force-proc-fallback", false, "attach via /proc/<pid>/fd instead of pidfd_getfd")
 	uninstall     = flag.Bool("uninstall", false, "on exit, clear ownership so clients revert immediately")
+	debug         = flag.Bool("debug", false, "debug logging")
+	useHello      = flag.Bool("hello", true, "fast discovery: hello-probe uprobes and mapping events (falls back to scan-only)")
 	latencyWindow = 4096
 )
 
@@ -79,11 +82,17 @@ type agent struct {
 	rejected map[string]int
 	detached int
 	start    time.Time
+	hello    *hello.Watcher
+	mode     string // discovery: "hello" or "scan-only"
 }
 
 func main() {
 	flag.Parse()
-	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	lvl := slog.LevelInfo
+	if *debug {
+		lvl = slog.LevelDebug
+	}
+	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: lvl}))
 	a := &agent{log: log, clients: map[procctl.Key]*tracked{}, rejected: map[string]int{}, start: time.Now()}
 	reg, err := procctl.NewRegistry(procctl.RegistryOptions{
 		Consumer: consumerName, RescanInterval: *rescan, Lease: *lease, Logger: log,
@@ -102,6 +111,17 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go func() { _ = reg.Run(ctx) }()
+	a.mode = "scan-only"
+	if *useHello {
+		w, err := hello.New(hello.Options{Notify: reg.Notify, Logger: log})
+		if err != nil {
+			log.Warn("fast discovery unavailable, scan-only", "err", err)
+		} else {
+			a.hello, a.mode = w, "hello"
+			go func() { _ = w.Run(ctx) }()
+			defer w.Close()
+		}
+	}
 	if *useExclusive {
 		a.arb = exclusive.New(func() []exclusive.Target {
 			var ts []exclusive.Target
@@ -303,6 +323,8 @@ type summary struct {
 	RSSKB     int64             `json:"rss_kb"`
 	Mapped    int               `json:"mapped_regions"` // procctl memfds mapped in this agent
 	CPUS      float64           `json:"cpu_s"`
+	Discovery string            `json:"discovery"`
+	Hello     *hello.Stats      `json:"hello,omitempty"`
 	Clients   []clientSummary   `json:"clients"`
 	Resources []resourceSummary `json:"resources,omitempty"`
 }
@@ -323,10 +345,18 @@ func (a *agent) summary() {
 	_ = unix.Getrusage(unix.RUSAGE_SELF, &ru)
 	s := summary{
 		TS: time.Now(), Node: os.Getenv("NODE_NAME"), AgentPID: os.Getpid(),
-		Kernel:  unix.ByteSliceToString(u.Release[:]),
-		UptimeS: time.Since(a.start).Seconds(),
-		RSSKB:   ru.Maxrss,
-		CPUS:    time.Duration(ru.Utime.Nano() + ru.Stime.Nano()).Seconds(),
+		Kernel:    unix.ByteSliceToString(u.Release[:]),
+		UptimeS:   time.Since(a.start).Seconds(),
+		RSSKB:     ru.Maxrss,
+		CPUS:      time.Duration(ru.Utime.Nano() + ru.Stime.Nano()).Seconds(),
+		Discovery: a.mode,
+	}
+	if a.hello != nil {
+		st := a.hello.Stats()
+		s.Hello = &st
+		if st.Uprobes == 0 && st.UprobeErrors > 0 {
+			s.Discovery = "mmap-only" // no CAP_SYS_ADMIN: mapping events and rescans
+		}
 	}
 	a.mu.Lock()
 	s.Detached = a.detached

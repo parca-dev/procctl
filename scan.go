@@ -25,6 +25,7 @@ type ScanOptions struct {
 	ProcRoot      string // default "/proc"
 	Consumer      string // only this consumer; "" = all
 	MaxFDsPerProc int    // default 65536
+	PIDs          []int  // only these processes; nil = all
 }
 
 // ScanStats reports the cost of a scan.
@@ -43,18 +44,22 @@ func Scan(ctx context.Context, opt ScanOptions) ([]Candidate, ScanStats, error) 
 	}
 	start := time.Now()
 	var stats ScanStats
-	ents, err := os.ReadDir(opt.ProcRoot)
-	if err != nil {
-		return nil, stats, err
+	pids := opt.PIDs
+	if pids == nil {
+		ents, err := os.ReadDir(opt.ProcRoot)
+		if err != nil {
+			return nil, stats, err
+		}
+		for _, e := range ents {
+			if pid, err := strconv.Atoi(e.Name()); err == nil {
+				pids = append(pids, pid)
+			}
+		}
 	}
 	var out []Candidate
-	for _, e := range ents {
+	for _, pid := range pids {
 		if ctx.Err() != nil {
 			return out, stats, ctx.Err()
-		}
-		pid, err := strconv.Atoi(e.Name())
-		if err != nil {
-			continue
 		}
 		stats.Procs++
 		dir := fmt.Sprintf("%s/%d/fd", opt.ProcRoot, pid)

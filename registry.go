@@ -106,10 +106,15 @@ func (r *Registry) Events() <-chan Event { return r.events }
 func (r *Registry) FirstScanDone() <-chan struct{} { return r.first }
 
 // Notify requests an immediate scan of one pid (hello probe, mapping event).
+// It never blocks; if too many are queued, a full scan is scheduled instead.
 func (r *Registry) Notify(pid int) {
 	select {
 	case r.notify <- pid:
 	default:
+		select {
+		case r.notify <- 0: // 0 = full scan
+		default:
+		}
 	}
 }
 
@@ -140,7 +145,7 @@ func (r *Registry) Run(ctx context.Context) error {
 		case <-rescan.C:
 			r.scan(ctx, 0)
 		case pid := <-r.notify:
-			r.scan(ctx, pid)
+			r.scan(ctx, pid) // 0 means everything
 		case <-hb.C:
 			for _, c := range r.Clients() {
 				if err := c.Heartbeat(); err != nil && !errors.Is(err, ErrNotOwner) {
@@ -154,6 +159,9 @@ func (r *Registry) Run(ctx context.Context) error {
 // scan attaches every new region; pid > 0 limits it to that process.
 func (r *Registry) scan(ctx context.Context, pid int) {
 	opt := ScanOptions{ProcRoot: r.opt.ProcRoot, Consumer: r.opt.Consumer}
+	if pid > 0 {
+		opt.PIDs = []int{pid}
+	}
 	cands, stats, err := Scan(ctx, opt)
 	if err != nil && ctx.Err() == nil {
 		r.log.Warn("scan failed", "err", err)

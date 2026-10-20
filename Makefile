@@ -7,7 +7,7 @@ SAN    := -fsanitize=address,undefined -fno-sanitize-recover=all
 generate:
 	scripts/gen-types.sh
 
-.PHONY: images e2e-kind generate all test test-c test-c-compile test-go bench fuzz-go fuzz-c model-long kernel-report demo clean
+.PHONY: images e2e-kind generate all test test-c test-c-compile test-go test-hello bench fuzz-go fuzz-c model-long kernel-report demo clean
 
 all: $(BIN)/echo-client $(BIN)/echo-agent
 
@@ -38,6 +38,13 @@ test-c: | $(BIN)
 test-go:
 	go vet ./...
 	go test -race -count=1 ./...
+
+# The hello watcher needs root (BPF, uprobes, perf). Runs in the initial pid
+# namespace and nested in a new one (the kind case: pids are translated).
+test-hello:
+	go test -c -o $(BIN)/hello.test ./hello
+	cd hello && sudo $(abspath $(BIN))/hello.test -test.v
+	cd hello && sudo unshare --pid --fork --mount-proc $(abspath $(BIN))/hello.test -test.v
 
 # poll() microbenchmarks. PROCCTL_BENCH_ENFORCE=1 fails if the no-change path is >= 2 ns.
 bench: | $(BIN)

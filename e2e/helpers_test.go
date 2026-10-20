@@ -101,6 +101,9 @@ func deployClients(t *testing.T, replicas int, args ...string) {
 func deployAgent(t *testing.T, args ...string) {
 	t.Helper()
 	apply(t, part(manifests(t), agentNS))
+	if os.Getenv("E2E_AGENT_DEBUG") != "" {
+		args = append(args, "--debug")
+	}
 	if len(args) > 0 {
 		setArgs(t, agentNS, "daemonset/"+agentDS, args)
 	}
@@ -116,9 +119,25 @@ func setArgs(t *testing.T, ns, obj string, args []string) {
 
 func pods(t *testing.T, ns, label string) []string {
 	t.Helper()
-	out := kubectl(t, "-n", ns, "get", "pods", "-l", label,
-		"--field-selector=status.phase=Running", "-o", "jsonpath={.items[*].metadata.name}")
-	return strings.Fields(out)
+	out := kubectl(t, "-n", ns, "get", "pods", "-l", label, "--field-selector=status.phase=Running", "-o", "json")
+	var list struct {
+		Items []struct {
+			Metadata struct {
+				Name              string  `json:"name"`
+				DeletionTimestamp *string `json:"deletionTimestamp"`
+			} `json:"metadata"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal([]byte(out), &list); err != nil {
+		t.Fatalf("pods: %v", err)
+	}
+	var names []string
+	for _, it := range list.Items {
+		if it.Metadata.DeletionTimestamp == nil { // terminating pods are still Running
+			names = append(names, it.Metadata.Name)
+		}
+	}
+	return names
 }
 
 // ---- agent summary ---------------------------------------------------------------
@@ -151,18 +170,22 @@ type clientSummary struct {
 }
 
 type summary struct {
-	TS        time.Time       `json:"ts"`
-	Node      string          `json:"node"`
-	AgentPID  int             `json:"agent_pid"`
-	Kernel    string          `json:"kernel"`
-	UptimeS   float64         `json:"uptime_s"`
-	Attached  int             `json:"attached"`
-	Owned     int             `json:"owned"`
-	Detached  int             `json:"detached"`
-	Rejected  map[string]int  `json:"rejected"`
-	RSSKB     int64           `json:"rss_kb"`
-	Mapped    int             `json:"mapped_regions"`
-	CPUS      float64         `json:"cpu_s"`
+	TS        time.Time      `json:"ts"`
+	Node      string         `json:"node"`
+	AgentPID  int            `json:"agent_pid"`
+	Kernel    string         `json:"kernel"`
+	UptimeS   float64        `json:"uptime_s"`
+	Attached  int            `json:"attached"`
+	Owned     int            `json:"owned"`
+	Detached  int            `json:"detached"`
+	Rejected  map[string]int `json:"rejected"`
+	RSSKB     int64          `json:"rss_kb"`
+	Mapped    int            `json:"mapped_regions"`
+	CPUS      float64        `json:"cpu_s"`
+	Discovery string         `json:"discovery"`
+	Hello     *struct {
+		FilesInspected, FilesWithHello, Uprobes, UprobesActive, FilesCached, UprobeErrors, Firings, MappingEvents, LostEvents, InspectFailures uint64
+	} `json:"hello"`
 	Clients   []clientSummary `json:"clients"`
 	Resources []struct {
 		HolderPID int     `json:"holder_pid"`
@@ -287,11 +310,15 @@ func logLatencies(t *testing.T, s summary) {
 // ---- client events (pod logs) ------------------------------------------------------
 
 type clientEvent struct {
-	Ev      string `json:"ev"`
-	Pod     string `json:"pod"`
-	TS      uint64 `json:"ts"`
-	Expired *int   `json:"expired"`
-	Grant   uint64 `json:"grant"`
+	Ev           string  `json:"ev"`
+	Pod          string  `json:"pod"`
+	PID          int     `json:"pid"`
+	TS           uint64  `json:"ts"`
+	Expired      *int    `json:"expired"`
+	Grant        uint64  `json:"grant"`
+	SinceStartMS float64 `json:"since_start_ms"`
+	Reinit       *int    `json:"reinit"`
+	InheritedAck int     `json:"inherited_ack"`
 }
 
 func clientEvents(t *testing.T, pod string) []clientEvent {

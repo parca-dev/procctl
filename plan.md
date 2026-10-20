@@ -147,7 +147,13 @@ Unchanged from the previous revision. Three layers, each a fallback for the one 
 **Packaging and privileges:**
 - procctl carries an attributed copy of the sideband reader in `internal/perfsideband`.
 - Inside parca-agent, ebpf-profiler's existing stream is plugged in through a `ProbeAttacher` instead.
-- Needs `CAP_PERFMON`, plus `CAP_BPF` for uprobes. Without them, the agent runs scan-only.
+- **Privileges (measured on 7.0):** mapping events need `CAP_PERFMON`; the hello program needs `CAP_BPF`; but the uprobe PMU refuses `CAP_PERFMON` alone and needs **`CAP_SYS_ADMIN`**.
+  - Without `CAP_SYS_ADMIN`, discovery degrades to mapping events + rescans (`mmap-only`): a mapping of a file with hello sites still triggers a pid scan, but late `procctl_init` and fork `reinit` wait for the rescan.
+  - Without `CAP_BPF`/`CAP_PERFMON`, the agent runs scan-only.
+- **Pid namespaces:** `bpf_get_current_pid_tgid()` reports root-namespace pids, which only match `/proc` for an agent in the initial pid namespace (`hostPID` on a real node). When nested (kind: the node is a container), the program walks `current->group_leader->thread_pid->numbers[]`, with offsets from kernel BTF, and reports the pid whose `ns->ns.inum` is the agent's pid namespace. Root is detected by the fixed `PROC_PID_INIT_INO`; `NSpid` can't tell, since it is relative to the procfs mount.
+- **Overlayfs:** every container's copy of a binary reports its own `(dev, inode)`, though the uprobe lands on the shared backing inode. So the cache holds one entry, with its own uprobes, per container. Consequences:
+  - One hello call fires every duplicate; the reader coalesces repeated pids.
+  - A GC pass (every 2 min, one `/proc/*/maps` sweep) drops entries no live process maps and closes their uprobes. A forked child keeps the mapping, so it keeps them alive.
 
 ### 2.7 Symbol prefix and packaging
 
@@ -388,7 +394,7 @@ Apache-2.0. The bundled `<sys/sdt.h>` is SystemTap's (CC0). `internal/perfsideba
   - `/metrics`: push latency, `procctl_clients{owned}`, rejections by reason, scan cost, attach path, state-read latency and failures, wake-to-ack latency;
   - arbiter metrics: grants, renewals, release-confirm latency, blocked seconds per resource, holder exits;
   - `/summary`, and a `PROCCTL_SUMMARY` log line on SIGTERM.
-- **Security context:** `hostPID`, `SYS_PTRACE` (covers `pidfd_getfd`, `/proc/<pid>/fd`, `process_vm_readv`), and `BPF` + `PERFMON`. Overlays add AppArmor and SELinux settings; `privileged` is the fallback.
+- **Security context:** `hostPID`, `SYS_PTRACE` (covers `pidfd_getfd`, `/proc/<pid>/fd`, `process_vm_readv`), `BPF` + `PERFMON`, and `SYS_ADMIN` for the uprobe PMU (§2.6). Overlays add AppArmor and SELinux settings; `privileged` is the fallback.
 
 ---
 
@@ -519,6 +525,13 @@ Durations assume 1 engineer and are rough.
 - **Demo:** `examples/token` with three processes rotating a simulated resource on one host. Killing the holder hands over immediately; SIGSTOPping it blocks without overlap. The model tests run green in CI.
 
 ### M3 — Test images and the e2e suite (≈3 weeks)
+
+**Status (2026-10-20):**
+- **Phase 1 done:** images, manifests, and S2–S6 (plus S15).
+- **Phase 2 done:** fast discovery: `hello/` (USDT + uprobes, pid-namespace translation, GC), `internal/perfsideband` (mmap2), and S1 + S7 on kind.
+  - S1: init → first apply in ~20–100 ms, whether init runs at exec or 2 s later. The rescan is effectively off, and the first apply waits for the agent's 10 Hz write cadence.
+  - S7: 2 parents + 16 reinit children all attached, ~70–100 ms. Inherited-state children are never attached, and their writes are refused with `-ECHILD`.
+
 - **Images and manifests:** testclient and testagent (§6); `deploy/` overlays.
 - **The suite:** S1–S16 on kind, with S9 at reduced scale and S12 as far as kind allows.
 - **CI:** `e2e-kind.yml` on every PR, amd64 and arm64, two Kubernetes versions.

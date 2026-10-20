@@ -35,8 +35,10 @@ spec:
             runAsUser: 0
             capabilities:
               # SYS_PTRACE: pidfd_getfd, /proc/<pid>/fd, process_vm_readv.
-              # BPF + PERFMON: hello-probe uprobes and mapping events.
-              add: [SYS_PTRACE, BPF, PERFMON]
+              # BPF + PERFMON: the hello program and mapping events.
+              # SYS_ADMIN: the uprobe PMU refuses CAP_PERFMON alone (7.0);
+              # without it discovery degrades to mapping events + rescans.
+              add: [SYS_PTRACE, BPF, PERFMON, SYS_ADMIN]
             seccompProfile: {type: RuntimeDefault}
           resources:
             requests: {cpu: 50m, memory: 32Mi}

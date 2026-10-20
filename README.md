@@ -39,7 +39,7 @@ A bad address just makes the read fail. A forked child's inherited copy (same ad
 
 | | Process side (C, `procctl.h`) | Agent side (Go, `procctl` package) |
 |---|---|---|
-| **Start** | `procctl_init` creates the memfd, writes the header, seals it, maps it read-only, keeps the fd open, and fires the `procctl:hello` USDT probe. | `Registry.Run` scans `/proc/*/fd` for `/memfd:procctl:*`: at startup, every 60 s, and immediately on `Registry.Notify(pid)` (e.g. from the hello probe). |
+| **Start** | `procctl_init` creates the memfd, writes the header, seals it, maps it read-only, keeps the fd open, and fires the `procctl:hello` USDT probe. | `Registry.Run` scans `/proc/*/fd` for `/memfd:procctl:*`: at startup, every 60 s, and immediately on `Registry.Notify(pid)`. The `hello` package calls it when the hello uprobe fires, or when a process maps a binary or library containing the probe (perf mmap2 events). |
 | **Attach** | — | `Attach` pins the process with a pidfd, fetches the fd (`pidfd_getfd`, or `/proc/<pid>/fd/<n>`), checks it's a sealed tmpfs file of sane size, maps it, and validates a private copy of the header. It emits `Attached`. |
 | **Ownership** | Sees `writer_id ≠ 0`, so `procctl_agent_attached` is true. | Claims the region (CAS on `writer_id`). If another healthy agent owns it, this one stays passive and only reads. |
 | **Lease** | `procctl_lease_expired` is true if the heartbeat stops changing for `lease_ns`. Then: use defaults, release resources. | Heartbeats every `Lease/4`. |

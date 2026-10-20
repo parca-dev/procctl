@@ -46,6 +46,8 @@ jobs:
         env:
           PROCCTL_STRESS_SECONDS: "60"
         run: go test -race -count=1 -timeout 20m ./...
+      - name: hello watcher as root (uprobes, mmap2 events, pid-namespace translation)
+        run: make test-hello
       - name: poll() benchmark
         run: |
           {
