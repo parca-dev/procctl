@@ -3,6 +3,7 @@ package e2e
 import (
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -12,6 +13,7 @@ import (
 // isolated (its reads fail, nobody else notices). The agent never crashes and
 // well-behaved clients are unaffected.
 func TestS8Hostile(t *testing.T) {
+	t.Parallel()
 	rejected := map[string]string{ // mode → rejection reason (substring)
 		"no-seals":          "missing seals",
 		"grow-seal-missing": "missing seals",
@@ -24,21 +26,34 @@ func TestS8Hostile(t *testing.T) {
 		"no-state":          "no state block",
 	}
 	isolated := []string{"bad-state-addr", "state-never-even"} // attached; state reads fail
-	reset(t)
-	deployAgent(t)
-	deployClients(t, 2)
-	good := pods(t, clientNS, "app="+clientDP)
+	e := newScenario(t, "s8")
+	e.agent(agentDS, nil)
+	good := e.clients(clientDP, 2)
 
-	hostilePods := map[string]string{} // pod → mode
+	// One deployment per mode, rolled out concurrently.
 	modes := append(append([]string{"spoof-pid"}, isolated...), keys(rejected)...)
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	spoofPod := ""
 	for _, m := range modes {
-		ps, err := deployVariant(t, "hostile-"+m, 1, []string{"--hostile=" + m})
-		if err != nil {
-			t.Fatalf("hostile %s: %v", m, err)
-		}
-		hostilePods[ps[0]] = m
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ps, err := e.clientsWithin(120*time.Second, "hostile-"+m, 1, nil, "--hostile="+m)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				t.Errorf("hostile %s: %v", m, err)
+			} else if m == "spoof-pid" {
+				spoofPod = ps[0]
+			}
+		}()
 	}
-	s := waitSummary(t, 30*time.Second, "every hostile region seen", func(s summary) bool {
+	wg.Wait()
+	if t.Failed() {
+		t.FailNow()
+	}
+	s := e.wait(30*time.Second, "every hostile region seen", func(s summary) bool {
 		for _, reason := range rejected {
 			if !hasReason(s, reason) {
 				return false
@@ -50,12 +65,9 @@ func TestS8Hostile(t *testing.T) {
 				isolatedSeen++
 			}
 		}
-		_, spoofSeen := byPod(s)[podFor(hostilePods, "spoof-pid")]
-		return isolatedSeen == len(isolated) && spoofSeen && allAttached(t, good)(s)
+		_, spoofSeen := byPod(s)[spoofPod]
+		return isolatedSeen == len(isolated) && spoofSeen && allAttached(good)(s)
 	})
-	for m, reason := range rejected {
-		t.Logf("%-18s rejected: %q", m, reason)
-	}
 	// spoof-pid: the header lies about the pid; the agent uses the pid it found
 	// the fd under, which checkHealthy (S15) compares with the client's getpid().
 	checkHealthy(t, s)
@@ -66,13 +78,13 @@ func TestS8Hostile(t *testing.T) {
 		}
 		t.Errorf("%d attached, want %d (good + spoof-pid + isolated): %v", s.Attached, want, who)
 	}
-	time.Sleep(5 * time.Second) // several rescans and reads of the hostile regions
-	s, _ = latestSummary(t)
+	time.Sleep(3 * time.Second) // more rescans and reads of the hostile regions
+	s, _ = e.latest()
 	checkHealthy(t, s)
-	if !allAttached(t, good)(s) {
+	if !allAttached(good)(s) {
 		t.Error("well-behaved clients affected")
 	}
-	if n := restarts(t, agentNS, "app="+agentDS); n != 0 {
+	if n := e.restarts(e.agentNS, "app="+agentDS); n != 0 {
 		t.Errorf("agent restarted %d times", n)
 	}
 	t.Logf("rejections: %v", s.Rejected)
@@ -85,15 +97,6 @@ func hasReason(s summary, substr string) bool {
 		}
 	}
 	return false
-}
-
-func podFor(m map[string]string, mode string) string {
-	for p, v := range m {
-		if v == mode {
-			return p
-		}
-	}
-	return ""
 }
 
 func keys(m map[string]string) []string {

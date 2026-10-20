@@ -1,29 +1,33 @@
 package e2e
 
 import (
-	"fmt"
 	"strings"
 	"testing"
 	"time"
+
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 )
 
 // S10: the client is an ordinary restricted workload (PSA restricted and
 // RuntimeDefault seccomp are the base manifests); here also in its own user
 // namespace (hostUsers: false), where the cluster supports it.
 func TestS10UserNamespace(t *testing.T) {
-	reset(t)
-	deployAgent(t)
-	ps, err := deployVariantWithin(t, 40*time.Second, "userns", 2, []string{"--poll-us=1000"},
-		`{"spec":{"template":{"spec":{"hostUsers":false}}}}`)
+	t.Parallel()
+	e := newScenario(t, "s10")
+	e.agent(agentDS, nil)
+	no := false
+	ps, err := e.clientsWithin(40*time.Second, clientDP, 2, func(d *appsv1.Deployment) {
+		d.Spec.Template.Spec.HostUsers = &no
+	})
 	if err != nil {
 		// kind: runc can't mount sysfs for a user-namespaced pod inside the
 		// node container. Runs on real nodes (M4).
-		ev, _ := kubectlErr("-n", clientNS, "get", "events", "--field-selector=reason=FailedCreatePodSandBox",
+		ev, _ := kubectlErr("-n", e.clientNS, "get", "events", "--field-selector=reason=FailedCreatePodSandBox",
 			"-o", "jsonpath={.items[-1:].message}")
-		kubectlErr("-n", clientNS, "delete", "deployment/userns", "--wait=false")
 		t.Skipf("hostUsers: false pods don't start on this cluster: %s", lastLines(ev, 1))
 	}
-	s := waitSummary(t, 30*time.Second, "user-namespaced clients attached", allAttached(t, ps))
+	s := e.wait(30*time.Second, "user-namespaced clients attached", allAttached(ps))
 	checkHealthy(t, s)
 	for _, p := range ps {
 		c := byPod(s)[p]
@@ -34,34 +38,35 @@ func TestS10UserNamespace(t *testing.T) {
 
 // S11: every attach path × read path.
 func TestS11AttachAndReadPaths(t *testing.T) {
-	reset(t)
-	deployClients(t, 2)
-	want := pods(t, clientNS, "app="+clientDP)
+	t.Parallel()
 	for _, tc := range []struct {
+		id           string
 		args         []string
 		attach, read string
 	}{
-		{nil, "pidfd_getfd", "process_vm_readv"},
-		{[]string{"--force-proc-fallback"}, "proc", "process_vm_readv"},
-		{[]string{"--force-mem-fallback"}, "pidfd_getfd", "proc_mem"},
-		{[]string{"--force-proc-fallback", "--force-mem-fallback"}, "proc", "proc_mem"},
+		{"s11-pidfd-vm", nil, "pidfd_getfd", "process_vm_readv"},
+		{"s11-proc-vm", []string{"--force-proc-fallback"}, "proc", "process_vm_readv"},
+		{"s11-pidfd-mem", []string{"--force-mem-fallback"}, "pidfd_getfd", "proc_mem"},
+		{"s11-proc-mem", []string{"--force-proc-fallback", "--force-mem-fallback"}, "proc", "proc_mem"},
 	} {
-		label := tc.attach + " + " + tc.read
-		kubectlErr("delete", "namespace", agentNS, "--ignore-not-found", "--wait=true", "--timeout=120s")
-		deployAgent(t, append([]string{"--rate=10", "--rescan=2s", "--lease=3s"}, tc.args...)...)
-		s := waitSummary(t, 30*time.Second, label, func(s summary) bool {
-			if !allAttached(t, want)(s) {
-				return false
-			}
-			for _, c := range s.Clients {
-				if c.Path != tc.attach || c.ReadPath != tc.read || c.Samples < 5 {
+		t.Run(tc.attach+"+"+tc.read, func(t *testing.T) {
+			t.Parallel()
+			e := newScenario(t, tc.id)
+			want := e.clients(clientDP, 2)
+			e.agent(agentDS, nil, tc.args...)
+			s := e.wait(30*time.Second, tc.attach+" + "+tc.read, func(s summary) bool {
+				if !allAttached(want)(s) {
 					return false
 				}
-			}
-			return true
+				for _, c := range s.Clients {
+					if c.Path != tc.attach || c.ReadPath != tc.read || c.Samples < 5 {
+						return false
+					}
+				}
+				return true
+			})
+			checkHealthy(t, s)
 		})
-		checkHealthy(t, s)
-		t.Logf("%s: %d clients attached, acking and reporting state", label, len(s.Clients))
 	}
 }
 
@@ -70,50 +75,51 @@ func TestS11AttachAndReadPaths(t *testing.T) {
 // discovery is scan-only; without SYS_PTRACE nothing can attach, and clients
 // simply run on their defaults.
 func TestS12Degraded(t *testing.T) {
-	reset(t)
-	deployClients(t, 2)
-	want := pods(t, clientNS, "app="+clientDP)
+	t.Parallel()
 	for _, tc := range []struct {
-		caps      string
+		id        string
+		caps      []corev1.Capability
 		discovery string
 		attaches  bool
 	}{
-		{`["SYS_PTRACE","BPF","PERFMON"]`, "mmap-only", true},
-		{`["SYS_PTRACE"]`, "scan-only", true},
-		{`["BPF","PERFMON","SYS_ADMIN"]`, "", false},
+		{"s12-no-admin", []corev1.Capability{"SYS_PTRACE", "BPF", "PERFMON"}, "mmap-only", true},
+		{"s12-no-bpf", []corev1.Capability{"SYS_PTRACE"}, "scan-only", true},
+		{"s12-no-ptrace", []corev1.Capability{"BPF", "PERFMON", "SYS_ADMIN"}, "", false},
 	} {
-		kubectlErr("delete", "namespace", agentNS, "--ignore-not-found", "--wait=true", "--timeout=120s")
-		apply(t, part(manifests(t), agentNS))
-		kubectl(t, "-n", agentNS, "patch", "daemonset/"+agentDS, "--type=json", "-p",
-			fmt.Sprintf(`[{"op":"replace","path":"/spec/template/spec/containers/0/securityContext/capabilities/add","value":%s}]`, tc.caps))
-		kubectl(t, "-n", agentNS, "rollout", "status", "daemonset/"+agentDS, "--timeout=120s")
-		if tc.attaches {
-			s := waitSummary(t, 30*time.Second, "attached with caps "+tc.caps, allAttached(t, want))
-			checkHealthy(t, s)
-			if tc.discovery != "" && s.Discovery != tc.discovery {
-				// mmap-only is only known once a uprobe was tried.
-				t.Errorf("caps %s: discovery %q, want %q", tc.caps, s.Discovery, tc.discovery)
+		t.Run(tc.id, func(t *testing.T) {
+			t.Parallel()
+			e := newScenario(t, tc.id)
+			want := e.clients(clientDP, 2)
+			e.agent(agentDS, func(ds *appsv1.DaemonSet) {
+				ds.Spec.Template.Spec.Containers[0].SecurityContext.Capabilities.Add = tc.caps
+			})
+			if tc.attaches {
+				s := e.wait(30*time.Second, "attached", allAttached(want))
+				checkHealthy(t, s)
+				if s.Discovery != tc.discovery {
+					t.Errorf("discovery %q, want %q", s.Discovery, tc.discovery)
+				}
+				t.Logf("caps %v: discovery %s, %d clients attached", tc.caps, s.Discovery, s.Attached)
+				return
 			}
-			t.Logf("caps %s: discovery %s, %d clients attached", tc.caps, s.Discovery, s.Attached)
-			continue
-		}
-		time.Sleep(10 * time.Second)
-		s, ok := latestSummary(t)
-		if !ok {
-			t.Fatalf("caps %s: agent prints no summary", tc.caps)
-		}
-		if s.Attached != 0 {
-			t.Errorf("caps %s: %d attached without SYS_PTRACE", tc.caps, s.Attached)
-		}
-		if n := restarts(t, agentNS, "app="+agentDS); n != 0 {
-			t.Errorf("caps %s: agent restarted %d times", tc.caps, n)
-		}
-		for _, p := range want {
-			if ev := clientEvents(t, p); len(ev) == 0 || ev[len(ev)-1].Ev == "exit" {
-				t.Errorf("%s not running", p)
+			time.Sleep(6 * time.Second) // three rescans
+			s, ok := e.latest()
+			if !ok {
+				t.Fatal("agent prints no summary")
 			}
-		}
-		t.Logf("caps %s: agent up (discovery %s), nothing attached, clients on their defaults", tc.caps, s.Discovery)
+			if s.Attached != 0 {
+				t.Errorf("%d attached without SYS_PTRACE", s.Attached)
+			}
+			if n := e.restarts(e.agentNS, "app="+agentDS); n != 0 {
+				t.Errorf("agent restarted %d times", n)
+			}
+			for _, p := range want {
+				if ev := e.events(p); len(ev) == 0 || ev[len(ev)-1].Ev == "exit" {
+					t.Errorf("%s not running", p)
+				}
+			}
+			t.Logf("caps %v: agent up (discovery %s), nothing attached, clients on their defaults", tc.caps, s.Discovery)
+		})
 	}
 }
 

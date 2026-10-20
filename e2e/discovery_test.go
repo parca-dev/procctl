@@ -13,45 +13,45 @@ const noRescan = "--rescan=1h"
 
 // firstApplies returns, per client (pod log "pod" field), the time from
 // procctl_init (or fork) to the first applied payload.
-func firstApplies(t *testing.T, pod string) map[string]float64 {
-	t.Helper()
+func (e *scenario) firstApplies(pod string) map[string]float64 {
+	e.t.Helper()
 	out := map[string]float64{}
-	for _, e := range clientEvents(t, pod) {
-		if e.Ev == "first_apply" {
-			if _, seen := out[e.Pod]; !seen {
-				out[e.Pod] = e.SinceStartMS
+	for _, ev := range e.events(pod) {
+		if ev.Ev == "first_apply" {
+			if _, seen := out[ev.Pod]; !seen {
+				out[ev.Pod] = ev.SinceStartMS
 			}
 		}
 	}
 	return out
 }
 
-func checkDiscoveryLatency(t *testing.T, label string, pods []string, want int, limitMS float64) {
-	t.Helper()
+func (e *scenario) checkDiscoveryLatency(label string, pods []string, want int, limitMS float64) {
+	e.t.Helper()
 	var all []float64
 	for _, p := range pods {
-		for who, ms := range firstApplies(t, p) {
+		for who, ms := range e.firstApplies(p) {
 			all = append(all, ms)
 			if ms > limitMS {
-				t.Errorf("%s: %s first applied %.0f ms after init (limit %.0f ms)", label, who, ms, limitMS)
+				e.t.Errorf("%s: %s first applied %.0f ms after init (limit %.0f ms)", label, who, ms, limitMS)
 			}
 		}
 	}
 	if len(all) != want {
-		t.Errorf("%s: %d clients applied a payload, want %d", label, len(all), want)
+		e.t.Errorf("%s: %d clients applied a payload, want %d", label, len(all), want)
 	}
 	sort.Float64s(all)
 	if len(all) > 0 {
-		t.Logf("%s: %d clients, init → first apply: median %.0f ms, max %.0f ms",
+		e.t.Logf("%s: %d clients, init → first apply: median %.0f ms, max %.0f ms",
 			label, len(all), all[len(all)/2], all[len(all)-1])
 	}
 }
 
-func requireHello(t *testing.T) summary {
-	t.Helper()
-	s := waitSummary(t, 30*time.Second, "agent summary", func(summary) bool { return true })
+func (e *scenario) requireHello() summary {
+	e.t.Helper()
+	s := e.wait(30*time.Second, "agent summary", func(summary) bool { return true })
 	if s.Discovery != "hello" {
-		t.Fatalf("agent runs discovery %q, want hello (BPF/perf unavailable in the agent pod?)", s.Discovery)
+		e.t.Fatalf("agent runs discovery %q, want hello (BPF/perf unavailable in the agent pod?)", s.Discovery)
 	}
 	return s
 }
@@ -60,27 +60,24 @@ func requireHello(t *testing.T) summary {
 // the agent are found by the mapping event (first exec of a never-seen
 // binary) or the hello probe, and apply a payload < 1 s after init.
 func TestS1ColdDiscovery(t *testing.T) {
-	reset(t)
-	deployAgent(t, noRescan)
-	requireHello(t)
-
+	t.Parallel()
 	for _, tc := range []struct {
-		label string
-		args  []string
+		id, label string
+		args      []string
 	}{
-		{"init at exec", nil},
-		{"init 2 s after exec (lazy library init)", []string{"--init-delay-ms=2000"}},
+		{"s1-exec", "init at exec", nil},
+		{"s1-lazy", "init 2 s after exec (lazy library init)", []string{"--init-delay-ms=2000"}},
 	} {
-		kubectlErr("delete", "namespace", clientNS, "--ignore-not-found", "--wait=true", "--timeout=120s")
-		deployClients(t, 4, tc.args...)
-		want := pods(t, clientNS, "app="+clientDP)
-		waitSummary(t, 15*time.Second, tc.label+": all attached", allAttached(t, want))
-		checkDiscoveryLatency(t, "S1 "+tc.label, want, len(want), 1000)
-	}
-	s, _ := latestSummary(t)
-	checkHealthy(t, s)
-	if s.Hello != nil {
-		t.Logf("hello watcher: %+v", *s.Hello)
+		t.Run(tc.id, func(t *testing.T) {
+			t.Parallel()
+			e := newScenario(t, tc.id)
+			e.agent(agentDS, nil, noRescan)
+			e.requireHello()
+			want := e.clients(clientDP, 4, tc.args...)
+			s := e.wait(15*time.Second, tc.label+": all attached", allAttached(want))
+			e.checkDiscoveryLatency("S1 "+tc.label, want, len(want), 1000)
+			checkHealthy(t, s)
+		})
 	}
 }
 
@@ -89,18 +86,17 @@ func TestS1ColdDiscovery(t *testing.T) {
 // write it (-ECHILD); children that re-initialize get their own region and
 // are found via hello in < 1 s.
 func TestS7Fork(t *testing.T) {
+	t.Parallel()
 	const replicas, workers = 2, 8
-	reset(t)
-	deployAgent(t, noRescan, "--exclusive")
-	requireHello(t)
-
 	t.Run("inherit", func(t *testing.T) {
-		kubectlErr("delete", "namespace", clientNS, "--ignore-not-found", "--wait=true", "--timeout=120s")
-		deployClients(t, replicas, "--exclusive", "--fork-after-ms=1000", fmt.Sprintf("--fork-workers=%d", workers))
-		want := pods(t, clientNS, "app="+clientDP)
-		waitSummary(t, 15*time.Second, "parents attached", allAttached(t, want))
-		time.Sleep(5 * time.Second) // children run, exclusive turns rotate
-		s, _ := latestSummary(t)
+		t.Parallel()
+		e := newScenario(t, "s7-inherit")
+		e.agent(agentDS, nil, noRescan, "--exclusive", "--hold=1s", "--deadline=3s")
+		e.requireHello()
+		want := e.clients(clientDP, replicas, "--exclusive", "--fork-after-ms=1000", fmt.Sprintf("--fork-workers=%d", workers))
+		e.wait(15*time.Second, "parents attached", allAttached(want))
+		time.Sleep(3 * time.Second) // children run, exclusive turns rotate
+		s, _ := e.latest()
 		checkHealthy(t, s)
 		if len(s.Clients) != replicas {
 			t.Errorf("%d clients attached, want only the %d parents", len(s.Clients), replicas)
@@ -119,11 +115,11 @@ func TestS7Fork(t *testing.T) {
 		}
 		for _, p := range want {
 			n := 0
-			for _, e := range clientEvents(t, p) {
-				if e.Ev == "forked_child" {
+			for _, ev := range e.events(p) {
+				if ev.Ev == "forked_child" {
 					n++
-					if e.InheritedAck != -10 {
-						t.Errorf("%s child %d: ack on the inherited state block returned %d, want -ECHILD", p, e.PID, e.InheritedAck)
+					if ev.InheritedAck != -10 {
+						t.Errorf("%s child %d: ack on the inherited state block returned %d, want -ECHILD", p, ev.PID, ev.InheritedAck)
 					}
 				}
 			}
@@ -132,19 +128,20 @@ func TestS7Fork(t *testing.T) {
 			}
 		}
 	})
-
 	t.Run("reinit", func(t *testing.T) {
-		kubectlErr("delete", "namespace", clientNS, "--ignore-not-found", "--wait=true", "--timeout=120s")
-		deployClients(t, replicas, "--fork-after-ms=1000", fmt.Sprintf("--fork-workers=%d", workers), "--fork-reinit")
-		want := pods(t, clientNS, "app="+clientDP)
+		t.Parallel()
+		e := newScenario(t, "s7-reinit")
+		e.agent(agentDS, nil, noRescan)
+		e.requireHello()
+		want := e.clients(clientDP, replicas, "--fork-after-ms=1000", fmt.Sprintf("--fork-workers=%d", workers), "--fork-reinit")
 		all := append([]string{}, want...)
 		for _, p := range want {
 			for k := 0; k < workers; k++ {
 				all = append(all, fmt.Sprintf("%s-child%d", p, k))
 			}
 		}
-		s := waitSummary(t, 15*time.Second, "parents and reinit children attached", allAttached(t, all))
+		s := e.wait(15*time.Second, "parents and reinit children attached", allAttached(all))
 		checkHealthy(t, s)
-		checkDiscoveryLatency(t, "S7 reinit", want, len(all), 1000)
+		e.checkDiscoveryLatency("S7 reinit", want, len(all), 1000)
 	})
 }

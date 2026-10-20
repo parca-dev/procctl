@@ -548,7 +548,17 @@ Durations assume 1 engineer and are rough.
 
     `--no-ctl-thread` isn't implemented yet.
   - **S16:** from agent write to the client's state showing `grants_seen_gen`: p50 ~0.9 ms, p99 ~1.4 ms.
-- **Phase 4:** `.github/workflows/e2e-kind.yml` runs S1–S16 on {amd64, arm64} × Kubernetes {v1.35.0 (oldest supported), v1.37.0} with kind v0.33.0. It runs on PRs, on pushes to main, and on demand. Each job uploads the test log, plus kind's cluster logs on failure, and writes a job summary. The node image is chosen with `E2E_KIND_IMAGE`. Locally, a full run on either version takes 11–13 min.
+- **Phase 4:** `.github/workflows/e2e-kind.yml` runs S1–S16 on {amd64, arm64} × Kubernetes {v1.35.0 (oldest supported), v1.37.0} with kind v0.33.0. It runs on PRs, on pushes to main, and on demand. Each job uploads the test log, plus kind's cluster logs on failure, and writes a job summary. The node image is chosen with `E2E_KIND_IMAGE`.
+- **Fast suite (after phase 4):** the scenarios now run in parallel on the one node.
+  - **Isolation:** each scenario has its own agent and client namespaces and its own consumer (`--consumer`). An agent serves only its own consumer, so scenarios can't see each other's clients.
+  - **Shorter clocks:** S5/S13 leases of 1–2 s; S14 turns of 1–2 s with a 3 s deadline; 3 s stability windows; an 8 s lone holder.
+  - **Concurrency:** S9 (whole-node load) runs alone first, then up to 8 scenarios at a time.
+  - **Result:** a full run takes **~1.5–2 min** locally (was 12.7 min).
+  - **Long mode:** `E2E_LONG=1` (nightly, `make e2e-kind-long`) restores the plan's sizes: S6 200 clients, S9 5k processes, a 10 min lone holder, S14 with 8 and 50 clients, 3 agent kills.
+- **Lessons from parallel runs:**
+  - With ~25 concurrent scenarios, kind pod starts took up to ~54 s. That's beyond any lease, so 8 scenarios at a time is the limit.
+  - S3 now requires "no fallback" only for overlapping hand-overs (maxSurge 1). A pod delete has an inherent gap.
+  - Agents × containers multiply duplicate per-container uprobes (overlayfs): 25 agents × ~110 containers gave 226 uprobes per agent. This is fine for one agent with a few client containers per node; dedup by backing inode is future work.
 
 - **Images and manifests:** testclient and testagent (§6); `deploy/` overlays.
 - **The suite:** S1–S16 on kind, with S9 at reduced scale and S12 as far as kind allows.
@@ -556,10 +566,12 @@ Durations assume 1 engineer and are rough.
 - **Demo:** `make e2e-kind` runs in under 20 min and emits artifacts. The S14 overlap checker is green.
 
 ### M4 — EKS/GKE matrix, run by hand from a developer account (≈1.5 weeks)
-- **Clusters:**
-  - `infra/eks` (eksctl, 4 spot nodegroups: AL2023 and Bottlerocket on x86 and Graviton);
-  - `infra/gke` (gcloud, 4 spot pools: COS and Ubuntu on x86 and T2A, plus an optional Sandbox pool).
-- **The runner:** `scripts/cloud-e2e.sh <eks|gke>` creates, runs, collects, and deletes from an `EXIT` trap. `make e2e-eks`, `make e2e-gke` and `make cloud-sweep` wrap it.
+- **One node pool per run:** procctl is node-local, so every scenario is a single-node experiment. Each run creates a cluster with **one node** of one OS/arch combination and runs the same fast suite as kind.
+  - **EKS:** `al2023-x86`, `al2023-arm`, `bottlerocket-x86`, `bottlerocket-arm`.
+  - **GKE:** `cos-x86`, `cos-arm`, `ubuntu-x86`, `ubuntu-arm`, plus an optional `sandbox` (gVisor, S12).
+  - Covering the whole matrix means one run per pool, run one after another or in separate clusters.
+- **Node access** (signals, `/proc` checks) goes through a privileged `hostPID` helper pod instead of `docker exec`.
+- **The runner:** `scripts/cloud-e2e.sh <eks|gke> <pool>` creates, runs, collects, and deletes from an `EXIT` trap. `make e2e-eks POOL=…`, `make e2e-gke POOL=…` and `make cloud-sweep` wrap it.
 - **Credentials:** from the CLIs. Images come from public GHCR, or `make images-push REGISTRY=…`.
 - **Demo:** both matrices green from a laptop, with `artifacts/report.md`, and nothing left running.
 
@@ -585,10 +597,10 @@ Durations assume 1 engineer and are rough.
 
 | Workflow | Trigger | Jobs |
 |---|---|---|
-| `ci.yml` | PR, push main | Go (vet, staticcheck, `-race`) and C (gcc/clang, C/C++, ASan/UBSan, symbol checks), each on amd64 and arm64; interop + offset checks; stress (60 s, both arches); arbiter model tests; fuzz (60 s/target); benchmarks → job summary; spec-check |
+| `ci.yml` | PR, push main | Go (vet, `-race`) and C (gcc/clang, C/C++, ASan/UBSan), each on amd64 and arm64; generated-types check; interop; stress smoke (3 s); arbiter model (200 schedules); fuzz seed corpora; root-only hello test; benchmarks → job summary |
 | `images.yml` | PR (build), main and tags (push) | multi-arch testagent and testclient; SBOM + cosign on tags |
-| `e2e-kind.yml` | PR, push main | {amd64, arm64} × {oldest, latest k8s} |
-| `fuzz-nightly.yml` | nightly | 30 min fuzzing + 15 min stress, both arches |
+| `e2e-kind.yml` | PR, push main | {amd64, arm64} × {oldest, latest k8s}, fast parallel suite |
+| `nightly.yml` | nightly | 15 min stress and 5000×10000 model schedules (both arches); 10 min/target Go fuzzing and 30 min libFuzzer; full-size e2e (`E2E_LONG`) on kind, both arches |
 | `release.yml` | tag `v*` | version check, `procctl.h` + checksums, release notes |
 
 **CI is kind-only.** EKS and GKE runs are manual (M4) until M6.

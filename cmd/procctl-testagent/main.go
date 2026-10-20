@@ -54,6 +54,7 @@ var (
 	wakeProbe     = flag.Duration("wake-probe", 0, "if > 0 (and not --exclusive): this often, rewrite each --exclusive client's grant table and time until its state shows grants_seen_gen (S16)")
 	uninstall     = flag.Bool("uninstall", false, "on exit, clear ownership so clients revert immediately")
 	debug         = flag.Bool("debug", false, "debug logging")
+	consumer      = flag.String("consumer", consumerName, "consumer to serve (e2e scenarios each use their own)")
 	useHello      = flag.Bool("hello", true, "fast discovery: hello-probe uprobes and mapping events (falls back to scan-only)")
 	latencyWindow = 4096
 )
@@ -103,7 +104,7 @@ func main() {
 	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: lvl}))
 	a := &agent{log: log, clients: map[procctl.Key]*tracked{}, rejected: map[string]int{}, start: time.Now()}
 	reg, err := procctl.NewRegistry(procctl.RegistryOptions{
-		Consumer: consumerName, RescanInterval: *rescan, Lease: *lease, Logger: log,
+		Consumer: *consumer, RescanInterval: *rescan, Lease: *lease, Logger: log,
 		ForceProcFallback: *procFallback, ForceMemFallback: *memFallback,
 		OnReject: func(pid, fd int, err error) {
 			a.mu.Lock()

@@ -49,3 +49,54 @@ jobs:
           gh issue create --repo "$GITHUB_REPOSITORY" \
             --title "nightly failed (${{ matrix.arch }}): $(date -u +%F)" \
             --body "See ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+  e2e-long:
+    name: e2e long (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: e2e/go.mod
+          cache-dependency-path: |
+            go.sum
+            e2e/go.sum
+      - name: Install kind
+        run: go install sigs.k8s.io/kind@v0.33.0
+      - name: Build the test images
+        run: make images
+      - name: Scenarios at full size (S6 200 clients, S9 5000 processes, 10 min lone holder, S14 8/50 clients)
+        env:
+          E2E_LONG: "1"
+          E2E_KEEP_CLUSTER: "1"
+        run: |
+          mkdir -p artifacts
+          cd e2e
+          set -o pipefail
+          go test -count=1 -timeout 75m -parallel 4 -v ./... 2>&1 | tee ../artifacts/e2e.log
+      - name: Collect cluster logs
+        if: failure()
+        run: kind export logs artifacts/kind --name procctl-e2e || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-long-${{ matrix.arch }}
+          path: artifacts/
+          retention-days: 14
+      - name: Open an issue on failure
+        if: failure() && github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue create --repo "$GITHUB_REPOSITORY" \
+            --title "nightly e2e failed (${{ matrix.arch }}): $(date -u +%F)" \
+            --body "See ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"

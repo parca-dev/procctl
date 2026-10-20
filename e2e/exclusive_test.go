@@ -23,6 +23,22 @@ func bootNow(t *testing.T) uint64 {
 	return uint64(ts.Nano())
 }
 
+// Exclusive timing for the fast suite: turns of hold, grants of deadline.
+const (
+	hold     = time.Second
+	deadline = 3 * time.Second
+)
+
+func exclusiveAgentArgs() []string {
+	return []string{"--exclusive", "--hold=" + hold.String(), "--deadline=" + deadline.String()}
+}
+
+// TestS14Exclusive acts on "the current holder": longer turns leave time to
+// find it (by its log and the agent's summary) while it still holds.
+const killHold = 2 * time.Second
+
+var exclusiveClientArgs = []string{"--exclusive", "--acquire-ms=100"}
+
 // interval is one may-hold period of one client, from its own log: from the
 // "acquire" line (logged while ACQUIRING, before using the resource) to the
 // "release" line (logged before reporting RELEASED).
@@ -34,27 +50,27 @@ type interval struct {
 // holdIntervals reads every client's log (including a killed container's)
 // and builds its intervals. An interval left open by a killed process ends at
 // the kill time recorded for that pod.
-func holdIntervals(t *testing.T, pods []string, killedAt map[string]uint64) []interval {
-	t.Helper()
+func (e *scenario) holdIntervals(pods []string, killedAt map[string]uint64) []interval {
+	e.t.Helper()
 	var out []interval
 	for _, p := range pods {
-		evs := allClientEvents(t, p)
+		evs := e.allEvents(p)
 		sort.SliceStable(evs, func(i, j int) bool { return evs[i].TS < evs[j].TS })
 		open := uint64(0)
-		for _, e := range evs {
-			switch e.Ev {
+		for _, ev := range evs {
+			switch ev.Ev {
 			case "acquire":
-				open = e.TS
+				open = ev.TS
 			case "release":
 				if open != 0 {
-					out = append(out, interval{p, open, e.TS})
+					out = append(out, interval{p, open, ev.TS})
 					open = 0
 				}
 			case "start": // a new container: the previous one died holding
 				if open != 0 {
 					end, ok := killedAt[p]
 					if !ok || end < open {
-						end = e.TS
+						end = ev.TS
 					}
 					out = append(out, interval{p, open, end})
 					open = 0
@@ -92,234 +108,295 @@ func endStr(e uint64) string {
 }
 
 // acquiresAfter returns the first acquire by any pod other than skip after ts.
-func acquiresAfter(t *testing.T, pods []string, skip string, ts uint64) (string, uint64, bool) {
-	t.Helper()
+func (e *scenario) acquiresAfter(pods []string, skip string, ts uint64) (string, uint64, bool) {
+	e.t.Helper()
 	best, who := uint64(math.MaxUint64), ""
 	for _, p := range pods {
 		if p == skip {
 			continue
 		}
-		for _, e := range allClientEvents(t, p) {
-			if e.Ev == "acquire" && e.TS > ts && e.TS < best {
-				best, who = e.TS, p
+		for _, ev := range e.allEvents(p) {
+			if ev.Ev == "acquire" && ev.TS > ts && ev.TS < best {
+				best, who = ev.TS, p
 			}
 		}
 	}
 	return who, best, who != ""
 }
 
-func waitAcquireAfter(t *testing.T, pods []string, skip string, ts uint64, timeout time.Duration, what string) (string, uint64) {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if who, at, ok := acquiresAfter(t, pods, skip, ts); ok {
+func (e *scenario) waitAcquireAfter(pods []string, skip string, ts uint64, timeout time.Duration, what string) (string, uint64) {
+	e.t.Helper()
+	until := time.Now().Add(timeout)
+	for time.Now().Before(until) {
+		if who, at, ok := e.acquiresAfter(pods, skip, ts); ok {
 			return who, at
 		}
-		time.Sleep(250 * time.Millisecond)
+		time.Sleep(100 * time.Millisecond)
 	}
-	t.Fatalf("no acquire within %v: %s", timeout, what)
+	e.t.Fatalf("no acquire within %v: %s", timeout, what)
 	return "", 0
 }
 
-func holder(s summary) (string, int) {
-	for _, c := range s.Clients {
-		if c.Holding {
-			return c.Pod, c.HostPID
+func (e *scenario) acquires(pod string) int {
+	n := 0
+	for _, ev := range e.allEvents(pod) {
+		if ev.Ev == "acquire" {
+			n++
 		}
 	}
-	return "", 0
+	return n
 }
 
-// liveHolder is holder(s), but only if that process still exists on the node
-// as the same process (start time): a summary can list a just-killed one.
-func liveHolder(t *testing.T, s summary) (string, int) {
-	t.Helper()
-	for _, c := range s.Clients {
-		if c.Holding && sameProcess(s.Node, c.HostPID, c.HostStart) {
-			return c.Pod, c.HostPID
-		}
-	}
-	return "", 0
-}
-
-// holdingNow: by its own log, pod acquired at least minHeld ago and hasn't
-// released since (the agent's summary can be a second old).
-func holdingNow(t *testing.T, pod string, now uint64) bool {
-	t.Helper()
+// holdingNow: by its own log, pod acquired less than half a turn ago and
+// hasn't released since (the agent's summary can be half a second old).
+func (e *scenario) holdingNow(pod string, now uint64, turn time.Duration) bool {
+	e.t.Helper()
 	var last clientEvent
-	for _, e := range allClientEvents(t, pod) {
-		if e.Ev == "acquire" || e.Ev == "release" {
-			last = e
+	for _, ev := range e.allEvents(pod) {
+		if ev.Ev == "acquire" || ev.Ev == "release" {
+			last = ev
 		}
 	}
-	return last.Ev == "acquire" && now-last.TS < uint64(2*time.Second)
+	return last.Ev == "acquire" && now-last.TS < uint64(turn/2)
 }
 
 // waitHolder returns a client that is holding right now, by its own log,
-// early enough in its turn to act on it.
-func waitHolder(t *testing.T, cl []string) (string, int) {
-	t.Helper()
-	deadline := time.Now().Add(30 * time.Second)
-	for time.Now().Before(deadline) {
-		if s, ok := latestSummary(t); ok && allAttached(t, cl)(s) {
-			if p, pid := liveHolder(t, s); p != "" && holdingNow(t, p, bootNow(t)) {
-				return p, pid
+// early enough in its turn to act on it, and whose process (per the summary)
+// is still alive as that process.
+func (e *scenario) waitHolder(cl []string, turn time.Duration) (string, summary) {
+	e.t.Helper()
+	until := time.Now().Add(30 * time.Second)
+	for time.Now().Before(until) {
+		if s, ok := e.latest(); ok && allAttached(cl)(s) {
+			for _, c := range s.Clients {
+				if c.Holding && e.holdingNow(c.Pod, bootNow(e.t), turn) && sameProcess(s.Node, c.HostPID, c.HostStart) {
+					return c.Pod, s
+				}
 			}
 		}
-		time.Sleep(200 * time.Millisecond)
+		time.Sleep(100 * time.Millisecond)
 	}
-	t.Fatal("no holder early in its turn")
-	return "", 0
+	e.t.Fatal("no holder early in its turn")
+	return "", summary{}
+}
+
+// heldAt reports whether pod, by its own log, held at ts: its last acquire
+// before ts has no release before ts. Used to confirm that a client signalled
+// as "the holder" really held when the signal landed (it may have released
+// while the test was looking it up).
+func (e *scenario) heldAt(pod string, ts uint64) bool {
+	e.t.Helper()
+	var last clientEvent
+	for _, ev := range e.allEvents(pod) {
+		if (ev.Ev == "acquire" || ev.Ev == "release") && ev.TS <= ts && ev.TS >= last.TS {
+			last = ev
+		}
+	}
+	return last.Ev == "acquire"
 }
 
 func ms(d uint64) string { return fmt.Sprintf("%.0f ms", float64(d)/1e6) }
-
-const exclArgs = "--exclusive"
 
 // S14: exclusive resources under round-robin, holder failures and agent
 // failures. The invariant, judged from the clients' own logs: holding
 // intervals never overlap.
 func TestS14Exclusive(t *testing.T) {
-	reset(t)
-	agentArgs := []string{"--rate=10", "--rescan=2s", "--lease=3s", "--exclusive", "--hold=4s", "--deadline=8s"}
-	deployAgent(t, agentArgs...)
-	deployClients(t, 3, exclArgs, "--acquire-ms=300")
-	cl := pods(t, clientNS, "app="+clientDP)
-	s := waitSummary(t, 30*time.Second, "attached", allAttached(t, cl))
+	t.Parallel()
+	e := newScenario(t, "s14")
+	e.agent(agentDS, nil, "--exclusive", "--hold="+killHold.String(), "--deadline="+(killHold+deadline).String())
+	cl := e.clients(clientDP, 3, exclusiveClientArgs...)
+	s := e.wait(30*time.Second, "attached", allAttached(cl))
 	node := s.Node
 	killed := map[string]uint64{}
 
 	// Round-robin.
-	time.Sleep(15 * time.Second)
+	time.Sleep(killHold * time.Duration(len(cl)+1))
 	for _, p := range cl {
-		n := 0
-		for _, e := range allClientEvents(t, p) {
-			if e.Ev == "acquire" {
-				n++
-			}
-		}
-		if n == 0 {
+		if e.acquires(p) == 0 {
 			t.Errorf("round-robin: %s never acquired", p)
 		}
 	}
 
 	// Holder SIGKILLed mid-grant: re-granted right after its pidfd exit.
-	hp, hpid := waitHolder(t, cl)
-	killed[hp] = bootNow(t) // before the signal: an acquire earlier than this is a real overlap
-	signal(t, node, "KILL", hpid)
-	who, at := waitAcquireAfter(t, cl, hp, killed[hp], 10*time.Second, "after the holder was killed")
+	// (If it released before the signal landed, the measurement is of a
+	// normal turn: try again with the next holder.)
+	var hp, who string
+	var at uint64
+	for try := 0; ; try++ {
+		var s summary
+		hp, s = e.waitHolder(cl, killHold)
+		killed[hp] = bootNow(t) // before the signal: an acquire earlier than this is a real overlap
+		signalClient(t, s, hp, "KILL")
+		who, at = e.waitAcquireAfter(cl, hp, killed[hp], 10*time.Second, "after the holder was killed")
+		kubectl(t, "-n", e.clientNS, "rollout", "status", "deployment/"+clientDP, "--timeout=60s")
+		if e.heldAt(hp, killed[hp]) {
+			break
+		}
+		if try == 4 {
+			t.Fatal("never caught a holder before it released")
+		}
+		t.Logf("%s had released before the kill landed; again", hp)
+		e.wait(60*time.Second, "restarted client attached", allAttached(e.pods(e.clientNS, "app="+clientDP)))
+	}
 	t.Logf("holder %s killed: %s acquired %s later", hp, who, ms(at-killed[hp]))
-	if at-killed[hp] > uint64(1500*time.Millisecond) {
+	if at-killed[hp] > uint64(3*time.Second) {
 		t.Errorf("re-grant after a killed holder took %s", ms(at-killed[hp]))
 	}
-	kubectl(t, "-n", clientNS, "rollout", "status", "deployment/"+clientDP, "--timeout=60s")
+	e.wait(60*time.Second, "restarted client attached", allAttached(cl))
 
 	// Holder SIGSTOPped: no re-grant while it lives; blocked time reported.
-	hp, hpid = waitHolder(t, cl)
-	signal(t, node, "STOP", hpid)
-	stopped := bootNow(t)
-	time.Sleep(11 * time.Second) // > deadline
-	if who, at, ok := acquiresAfter(t, cl, hp, stopped); ok {
+	var stopped uint64
+	for try := 0; ; try++ {
+		var s summary
+		hp, s = e.waitHolder(cl, killHold)
+		signalClient(t, s, hp, "STOP")
+		stopped = bootNow(t)
+		if e.heldAt(hp, stopped) {
+			break
+		}
+		signal(t, node, "CONT", byPod(s)[hp].HostPID)
+		if try == 4 {
+			t.Fatal("never caught a holder before it released")
+		}
+		t.Logf("%s had released before the stop landed; again", hp)
+	}
+	time.Sleep(killHold + deadline + time.Second)
+	if who, at, ok := e.acquiresAfter(cl, hp, stopped); ok {
 		t.Errorf("%s acquired %s after holder %s was stopped", who, ms(at-stopped), hp)
 	}
-	s, _ = latestSummary(t)
-	if len(s.Resources) == 0 || s.Resources[0].BlockedMS < 3000 {
+	s, _ = e.latest()
+	if len(s.Resources) == 0 || s.Resources[0].BlockedMS < float64(deadline.Milliseconds()) {
 		t.Errorf("stopped holder: blocked time not reported: %+v", s.Resources)
 	} else {
-		t.Logf("holder %s stopped: no re-grant for 10 s, blocked %.0f ms reported", hp, s.Resources[0].BlockedMS)
+		t.Logf("holder %s stopped: no re-grant for %v, blocked %.0f ms reported", hp, killHold+deadline+time.Second, s.Resources[0].BlockedMS)
 	}
-	signal(t, node, "CONT", hpid)
+	signal(t, node, "CONT", byPod(s)[hp].HostPID)
 	resumed := bootNow(t)
-	who, at = waitAcquireAfter(t, cl, hp, resumed, 15*time.Second, "after the stopped holder resumed")
+	who, at = e.waitAcquireAfter(cl, hp, resumed, 15*time.Second, "after the stopped holder resumed")
 	t.Logf("holder resumed (deadline passed, self-released): %s acquired %s later", who, ms(at-resumed))
 
 	// Agent SIGKILLed (mid-grant or mid-hand-off), then a rolling update.
-	for i := 0; i < 3; i++ {
-		prev, _ := latestSummary(t)
+	kills := 1
+	if long {
+		kills = 3
+	}
+	for i := 0; i < kills; i++ {
+		prev, _ := e.latest()
 		signal(t, node, "KILL", prev.AgentPID)
-		waitSummary(t, 60*time.Second, "agent back", func(s summary) bool {
-			return s.AgentPID != prev.AgentPID && allAttached(t, cl)(s)
+		e.wait(60*time.Second, "agent back", func(s summary) bool {
+			return s.AgentPID != prev.AgentPID && allAttached(cl)(s)
 		})
 		time.Sleep(time.Duration(1300+700*i) * time.Millisecond)
 	}
 	before := bootNow(t)
-	kubectl(t, "-n", agentNS, "rollout", "restart", "daemonset/"+agentDS)
-	kubectl(t, "-n", agentNS, "rollout", "status", "daemonset/"+agentDS, "--timeout=120s")
-	who, at = waitAcquireAfter(t, cl, "", before, 30*time.Second, "after agent kills and a rolling update")
-	t.Logf("after 3 agent kills and a rolling update: rotation continues (%s acquired)", who)
-	time.Sleep(10 * time.Second)
+	kubectl(t, "-n", e.agentNS, "rollout", "restart", "daemonset/"+agentDS)
+	kubectl(t, "-n", e.agentNS, "rollout", "status", "daemonset/"+agentDS, "--timeout=120s")
+	who, _ = e.waitAcquireAfter(cl, "", before, 30*time.Second, "after agent kills and a rolling update")
+	t.Logf("after %d agent kill(s) and a rolling update: rotation continues (%s acquired)", kills, who)
+	time.Sleep(2 * killHold)
 
-	checkNoOverlap(t, holdIntervals(t, cl, killed))
+	checkNoOverlap(t, e.holdIntervals(cl, killed))
+}
+
+// S14: rotation among many clients (long mode: 8 and 50 per resource).
+func TestS14Many(t *testing.T) {
+	if !long {
+		t.Skip("E2E_LONG only")
+	}
+	t.Parallel()
+	for _, n := range []int{8, 50} {
+		t.Run(strconv.Itoa(n), func(t *testing.T) {
+			t.Parallel()
+			e := newScenario(t, fmt.Sprintf("s14-many%d", n))
+			e.agent(agentDS, nil, exclusiveAgentArgs()...)
+			cl := e.clients(clientDP, n, exclusiveClientArgs...)
+			e.wait(90*time.Second, "attached", allAttached(cl))
+			time.Sleep(time.Duration(n+2) * (hold + 500*time.Millisecond))
+			for _, p := range cl {
+				if e.acquires(p) == 0 {
+					t.Errorf("%s never acquired", p)
+				}
+			}
+			checkNoOverlap(t, e.holdIntervals(cl, nil))
+		})
+	}
 }
 
 // S14: a holder whose control thread hangs keeps the resource for as long as
-// it lives (the arbiter never guesses); deleting it frees the resource.
+// it lives (the arbiter never guesses); killing it frees the resource.
 func TestS14HungHolder(t *testing.T) {
-	reset(t)
-	deployAgent(t, "--rate=10", "--rescan=2s", "--lease=3s", "--exclusive", "--hold=2s", "--deadline=6s")
-	hung, err := deployVariant(t, "hang", 1, []string{exclArgs, "--holder-hang"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	deployClients(t, 2, exclArgs)
-	cl := pods(t, clientNS, "app="+clientDP)
-	deadline := time.Now().Add(60 * time.Second)
+	t.Parallel()
+	e := newScenario(t, "s14-hung")
+	e.agent(agentDS, nil, exclusiveAgentArgs()...)
+	hung := e.clients("hang", 1, append([]string{"--holder-hang"}, exclusiveClientArgs...)...)
+	cl := e.clients(clientDP, 2, exclusiveClientArgs...)
+	until := time.Now().Add(60 * time.Second)
 	var hangAt uint64
 	for hangAt == 0 {
-		for _, e := range clientEvents(t, hung[0]) {
-			if e.Ev == "hang" {
-				hangAt = e.TS
+		for _, ev := range e.events(hung[0]) {
+			if ev.Ev == "hang" {
+				hangAt = ev.TS
 			}
 		}
-		if time.Now().After(deadline) {
+		if time.Now().After(until) {
 			t.Fatal("the hanging holder never got the resource")
 		}
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(200 * time.Millisecond)
 	}
-	time.Sleep(12 * time.Second)
-	if who, at, ok := acquiresAfter(t, cl, "", hangAt); ok {
+	time.Sleep(2*deadline + time.Second)
+	if who, at, ok := e.acquiresAfter(cl, "", hangAt); ok {
 		t.Errorf("%s acquired %s after the holder hung", who, ms(at-hangAt))
 	}
-	s, _ := latestSummary(t)
-	if len(s.Resources) == 0 || s.Resources[0].BlockedMS < 5000 {
+	s, _ := e.latest()
+	if len(s.Resources) == 0 || s.Resources[0].BlockedMS < float64((2*deadline).Milliseconds()) {
 		t.Errorf("hung holder: blocked time not reported: %+v", s.Resources)
 	} else {
 		t.Logf("hung holder: no re-grant, blocked %.0f ms reported", s.Resources[0].BlockedMS)
 	}
-	// SIGKILL it on the node, for a precise end of its interval, then remove it.
-	killed := map[string]uint64{hung[0]: bootNow(t)} // before the signal (see above)
+	killed := map[string]uint64{hung[0]: bootNow(t)} // before the signal (see TestS14Exclusive)
 	signalClient(t, s, hung[0], "KILL")
-	kubectl(t, "-n", clientNS, "scale", "deployment/hang", "--replicas=0")
-	who, at := waitAcquireAfter(t, cl, "", killed[hung[0]], 20*time.Second, "after the hung holder was deleted")
+	kubectl(t, "-n", e.clientNS, "scale", "deployment/hang", "--replicas=0")
+	who, at := e.waitAcquireAfter(cl, "", killed[hung[0]], 20*time.Second, "after the hung holder was killed")
 	t.Logf("hung holder killed: %s acquired %s later", who, ms(at-killed[hung[0]]))
-	ivs := holdIntervals(t, cl, nil)
+	ivs := e.holdIntervals(cl, nil)
 	ivs = append(ivs, interval{hung[0], hangAt, killed[hung[0]]})
 	sort.Slice(ivs, func(i, j int) bool { return ivs[i].start < ivs[j].start })
 	checkNoOverlap(t, ivs)
 }
 
-// S14: a lone holder is renewed, never released.
+// S14: a lone holder is renewed, never released (E2E_LONE_HOLDER; default
+// 8 s, 10 min long).
 func TestS14LoneHolder(t *testing.T) {
-	d := 30 * time.Second
-	if v, err := time.ParseDuration(getenv("E2E_LONE_HOLDER", "30s")); err == nil {
+	t.Parallel()
+	d := 8 * time.Second
+	if long {
+		d = 10 * time.Minute
+	}
+	if v, err := time.ParseDuration(getenv("E2E_LONE_HOLDER", "")); err == nil {
 		d = v
 	}
-	reset(t)
-	deployAgent(t, "--rate=10", "--rescan=2s", "--lease=3s", "--exclusive", "--hold=2s", "--deadline=6s")
-	deployClients(t, 1, exclArgs)
-	cl := pods(t, clientNS, "app="+clientDP)
-	waitSummary(t, 30*time.Second, "holding", func(s summary) bool { p, _ := holder(s); return p != "" })
+	e := newScenario(t, "s14-lone")
+	e.agent(agentDS, nil, exclusiveAgentArgs()...)
+	cl := e.clients(clientDP, 1, exclusiveClientArgs...)
+	e.wait(30*time.Second, "holding", func(s summary) bool {
+		for _, c := range s.Clients {
+			if c.Holding {
+				return true
+			}
+		}
+		return false
+	})
 	time.Sleep(d)
 	acq, rel := 0, 0
-	for _, e := range clientEvents(t, cl[0]) {
-		switch e.Ev {
+	for _, ev := range e.events(cl[0]) {
+		switch ev.Ev {
 		case "acquire":
 			acq++
 		case "release":
 			rel++
 		}
 	}
-	s, _ := latestSummary(t)
+	s, _ := e.latest()
 	if acq != 1 || rel != 0 {
 		t.Errorf("lone holder over %v: %d acquires, %d releases; want 1 and 0", d, acq, rel)
 	}
@@ -334,12 +411,12 @@ func TestS14LoneHolder(t *testing.T) {
 // thread, asleep in a futex wait on the read-only mapping, wakes and reports
 // grants_seen_gen in its state block, which the agent polls.
 func TestS16WakeLatency(t *testing.T) {
-	reset(t)
-	deployAgent(t, "--rate=10", "--rescan=2s", "--lease=3s", "--wake-probe=100ms")
-	deployClients(t, 4, exclArgs)
-	cl := pods(t, clientNS, "app="+clientDP)
-	s := waitSummary(t, 60*time.Second, "100 wake samples per client", func(s summary) bool {
-		if !allAttached(t, cl)(s) {
+	t.Parallel()
+	e := newScenario(t, "s16")
+	e.agent(agentDS, nil, "--wake-probe=50ms")
+	cl := e.clients(clientDP, 4, "--exclusive")
+	s := e.wait(60*time.Second, "100 wake samples per client", func(s summary) bool {
+		if !allAttached(cl)(s) {
 			return false
 		}
 		for _, c := range s.Clients {

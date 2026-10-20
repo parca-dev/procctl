@@ -42,9 +42,9 @@ jobs:
         run: make -s test-c
       - name: Go vet
         run: go vet ./...
-      - name: Go tests (-race; interop, conformance, 60 s stress, arbiter model and real holders)
-        env:
-          PROCCTL_STRESS_SECONDS: "60"
+      # Fuzz seed corpora, a 3 s stress and 200 model schedules; the long
+      # versions (fuzzing, 15 min stress, 5000 schedules) run nightly.
+      - name: Go tests (-race; interop, conformance, stress smoke, arbiter model and real holders)
         run: go test -race -count=1 -timeout 20m ./...
       - name: hello watcher as root (uprobes, mmap2 events, pid-namespace translation)
         run: make test-hello
@@ -56,19 +56,3 @@ jobs:
             make -s bench
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
-
-  fuzz:
-    name: fuzz (short)
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-      - name: Install clang
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang
-      - name: Go fuzzing (60 s per target)
-        run: make -s fuzz-go FUZZTIME=60s
-      - name: C libFuzzer (60 s)
-        run: make -s fuzz-c FUZZSECS=60

@@ -3,25 +3,41 @@ package e2e
 import (
 	"bufio"
 	"bytes"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	"sigs.k8s.io/yaml"
 )
 
+// Object names inside each scenario's namespaces.
 const (
-	agentNS  = "procctl-system"
-	clientNS = "procctl-clients"
 	agentDS  = "procctl-testagent"
 	clientDP = "procctl-testclient"
 )
+
+// long selects the plan's full sizes and durations (nightly); the default is
+// the fast PR suite.
+var long = os.Getenv("E2E_LONG") != ""
+
+// runID keeps this run's namespaces apart from leftovers of earlier ones.
+var runID = func() string {
+	b := make([]byte, 2)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}()
 
 // ---- kubectl ----------------------------------------------------------------
 
@@ -35,92 +51,208 @@ func kubectl(t *testing.T, args ...string) string {
 }
 
 func kubectlErr(args ...string) (string, error) {
+	return kubectlIn(nil, args...)
+}
+
+func kubectlIn(stdin []byte, args ...string) (string, error) {
 	cmd := exec.Command("kubectl", append([]string{"--kubeconfig", kubeconfig}, args...)...)
 	var b bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &b, &b
+	if stdin != nil {
+		cmd.Stdin = bytes.NewReader(stdin)
+	}
 	err := cmd.Run()
 	return b.String(), err
 }
 
-// manifests renders the deploy/ overlay with the images under test.
-func manifests(t *testing.T) string {
-	t.Helper()
-	out, err := exec.Command("kubectl", "kustomize", filepath.Join("..", "deploy", "overlays", "kind")).Output()
-	if err != nil {
-		t.Fatalf("kustomize: %v", err)
-	}
-	s := string(out)
-	if *imageRegistry != "" {
-		s = strings.ReplaceAll(s, "image: procctl-testagent:dev", fmt.Sprintf("image: %s/procctl-testagent:%s", *imageRegistry, *imageTag))
-		s = strings.ReplaceAll(s, "image: procctl-testclient:dev", fmt.Sprintf("image: %s/procctl-testclient:%s", *imageRegistry, *imageTag))
-	}
-	return s
+// ---- manifests -----------------------------------------------------------------
+
+type baseManifests struct {
+	agentNS, clientNS corev1.Namespace
+	agent             appsv1.DaemonSet
+	client            appsv1.Deployment
 }
 
-// part returns the documents of a rendered manifest that mention namespace ns.
-func part(all, ns string) string {
-	var keep []string
-	for _, doc := range strings.Split(all, "\n---\n") {
-		isNS := regexp.MustCompile(`(?m)^kind: Namespace$`).MatchString(doc) &&
-			regexp.MustCompile(`(?m)^  name: `+regexp.QuoteMeta(ns)+`$`).MatchString(doc)
-		if isNS || strings.Contains(doc, "namespace: "+ns) {
-			if isNS {
-				keep = append([]string{doc}, keep...) // namespaces first
-			} else {
-				keep = append(keep, doc)
+var (
+	baseOnce sync.Once
+	base     baseManifests
+	baseErr  error
+)
+
+// manifests renders deploy/overlays/kind once and decodes its objects.
+func manifests(t *testing.T) baseManifests {
+	t.Helper()
+	baseOnce.Do(func() {
+		out, err := exec.Command("kubectl", "kustomize", filepath.Join("..", "deploy", "overlays", "kind")).Output()
+		if err != nil {
+			baseErr = fmt.Errorf("kustomize: %w", err)
+			return
+		}
+		for _, doc := range strings.Split(string(out), "\n---\n") {
+			var meta struct {
+				Kind     string `json:"kind"`
+				Metadata struct {
+					Name string `json:"name"`
+				} `json:"metadata"`
+			}
+			if err := yaml.Unmarshal([]byte(doc), &meta); err != nil {
+				baseErr = err
+				return
+			}
+			switch {
+			case meta.Kind == "Namespace" && meta.Metadata.Name == "procctl-system":
+				baseErr = yaml.Unmarshal([]byte(doc), &base.agentNS)
+			case meta.Kind == "Namespace":
+				baseErr = yaml.Unmarshal([]byte(doc), &base.clientNS)
+			case meta.Kind == "DaemonSet":
+				baseErr = yaml.Unmarshal([]byte(doc), &base.agent)
+			case meta.Kind == "Deployment":
+				baseErr = yaml.Unmarshal([]byte(doc), &base.client)
+			}
+			if baseErr != nil {
+				return
 			}
 		}
+	})
+	if baseErr != nil {
+		t.Fatal(baseErr)
 	}
-	return strings.Join(keep, "\n---\n")
+	return base
 }
 
-func apply(t *testing.T, yaml string) {
+func image(name string) string {
+	if *imageRegistry != "" {
+		return fmt.Sprintf("%s/%s:%s", *imageRegistry, name, *imageTag)
+	}
+	return name + ":dev"
+}
+
+func applyObj(t *testing.T, obj any) {
 	t.Helper()
-	f := filepath.Join(t.TempDir(), "m.yaml")
-	if err := os.WriteFile(f, []byte(yaml), 0o644); err != nil {
+	b, err := yaml.Marshal(obj)
+	if err != nil {
 		t.Fatal(err)
 	}
-	kubectl(t, "apply", "-f", f)
-}
-
-// reset removes everything from a previous scenario.
-func reset(t *testing.T) {
-	t.Helper()
-	kubectlErr("delete", "namespace", agentNS, clientNS, "--ignore-not-found", "--wait=true", "--timeout=120s")
-}
-
-func deployClients(t *testing.T, replicas int, args ...string) {
-	t.Helper()
-	apply(t, part(manifests(t), clientNS))
-	if len(args) > 0 {
-		setArgs(t, clientNS, "deployment/"+clientDP, args)
+	if out, err := kubectlIn(b, "apply", "-f", "-"); err != nil {
+		t.Fatalf("kubectl apply: %v\n%s\n%s", err, out, b)
 	}
-	kubectl(t, "-n", clientNS, "scale", "deployment/"+clientDP, fmt.Sprintf("--replicas=%d", replicas))
-	kubectl(t, "-n", clientNS, "rollout", "status", "deployment/"+clientDP, "--timeout=180s")
 }
 
-func deployAgent(t *testing.T, args ...string) {
+// ---- per-scenario environment ----------------------------------------------------
+
+// scenario is one scenario's slice of the cluster: its own agent and client
+// namespaces and its own consumer name. An agent only serves its consumer, so
+// scenarios run in parallel on one node without seeing each other's clients.
+type scenario struct {
+	t                 *testing.T
+	agentNS, clientNS string
+	consumer          string
+}
+
+// newScenario creates the namespaces; they are deleted when the test ends
+// (kept on failure with E2E_KEEP_FAILED, for debugging; not by default, since a
+// failed scenario's load would otherwise disturb the ones still running).
+func newScenario(t *testing.T, id string) *scenario {
 	t.Helper()
-	apply(t, part(manifests(t), agentNS))
+	m := manifests(t)
+	e := &scenario{
+		t:        t,
+		agentNS:  "pa-" + id + "-" + runID,
+		clientNS: "pc-" + id + "-" + runID,
+		consumer: "tc_" + strings.ReplaceAll(id, "-", "_"),
+	}
+	if len(e.consumer) > 31 {
+		t.Fatalf("consumer %q too long", e.consumer)
+	}
+	for _, ns := range []struct {
+		obj  corev1.Namespace
+		name string
+	}{{m.agentNS, e.agentNS}, {m.clientNS, e.clientNS}} {
+		obj := *ns.obj.DeepCopy()
+		obj.Name = ns.name
+		if obj.Labels == nil {
+			obj.Labels = map[string]string{}
+		}
+		obj.Labels["procctl-e2e"] = "1"
+		applyObj(t, &obj)
+	}
+	t.Cleanup(func() {
+		if t.Failed() && os.Getenv("E2E_KEEP_FAILED") != "" {
+			t.Logf("keeping namespaces %s and %s", e.agentNS, e.clientNS)
+			return
+		}
+		kubectlErr("delete", "namespace", e.agentNS, e.clientNS, "--wait=false")
+	})
+	return e
+}
+
+// agentArgs: defaults, then the scenario's, then the consumer (last wins).
+func (e *scenario) agentArgs(args []string) []string {
+	a := []string{"--rate=10", "--rescan=2s", "--lease=3s", "--summary-interval=500ms"}
+	a = append(a, args...)
 	if os.Getenv("E2E_AGENT_DEBUG") != "" {
-		args = append(args, "--debug")
+		a = append(a, "--debug")
 	}
-	if len(args) > 0 {
-		setArgs(t, agentNS, "daemonset/"+agentDS, args)
-	}
-	kubectl(t, "-n", agentNS, "rollout", "status", "daemonset/"+agentDS, "--timeout=120s")
+	return append(a, "--consumer="+e.consumer)
 }
 
-func setArgs(t *testing.T, ns, obj string, args []string) {
-	t.Helper()
-	b, _ := json.Marshal(args)
-	patch := fmt.Sprintf(`[{"op":"replace","path":"/spec/template/spec/containers/0/args","value":%s}]`, b)
-	kubectl(t, "-n", ns, "patch", obj, "--type=json", "-p", patch)
+// agent deploys the agent DaemonSet named name (agentDS by default) and waits
+// for it. mutate, if set, edits the object before it is applied.
+func (e *scenario) agent(name string, mutate func(*appsv1.DaemonSet), args ...string) {
+	e.t.Helper()
+	m := manifests(e.t)
+	ds := m.agent.DeepCopy()
+	ds.Namespace, ds.Name = e.agentNS, name
+	ds.Labels = map[string]string{"app": name}
+	ds.Spec.Selector.MatchLabels = map[string]string{"app": name}
+	ds.Spec.Template.Labels = map[string]string{"app": name}
+	c := &ds.Spec.Template.Spec.Containers[0]
+	c.Image, c.Args = image("procctl-testagent"), e.agentArgs(args)
+	if mutate != nil {
+		mutate(ds)
+	}
+	applyObj(e.t, ds)
+	kubectl(e.t, "-n", e.agentNS, "rollout", "status", "daemonset/"+name, "--timeout=120s")
 }
 
-func pods(t *testing.T, ns, label string) []string {
-	t.Helper()
-	out := kubectl(t, "-n", ns, "get", "pods", "-l", label, "--field-selector=status.phase=Running", "-o", "json")
+// clients deploys replicas of the test client as Deployment name and returns
+// the running pods.
+func (e *scenario) clients(name string, replicas int, args ...string) []string {
+	e.t.Helper()
+	ps, err := e.clientsWithin(180*time.Second, name, replicas, nil, args...)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	return ps
+}
+
+func (e *scenario) clientsWithin(timeout time.Duration, name string, replicas int, mutate func(*appsv1.Deployment), args ...string) ([]string, error) {
+	e.t.Helper()
+	m := manifests(e.t)
+	d := m.client.DeepCopy()
+	d.Namespace, d.Name = e.clientNS, name
+	d.Labels = map[string]string{"app": name}
+	d.Spec.Selector.MatchLabels = map[string]string{"app": name}
+	d.Spec.Template.Labels = map[string]string{"app": name}
+	r := int32(replicas)
+	d.Spec.Replicas = &r
+	c := &d.Spec.Template.Spec.Containers[0]
+	c.Image = image("procctl-testclient")
+	c.Args = append(append([]string{"--poll-us=5000"}, args...), "--consumer="+e.consumer)
+	if mutate != nil {
+		mutate(d)
+	}
+	applyObj(e.t, d)
+	if out, err := kubectlErr("-n", e.clientNS, "rollout", "status", "deployment/"+name,
+		fmt.Sprintf("--timeout=%ds", int(timeout.Seconds()))); err != nil {
+		return nil, fmt.Errorf("%v: %s", err, out)
+	}
+	return e.pods(e.clientNS, "app="+name), nil
+}
+
+func (e *scenario) pods(ns, label string) []string {
+	e.t.Helper()
+	out := kubectl(e.t, "-n", ns, "get", "pods", "-l", label, "--field-selector=status.phase=Running", "-o", "json")
 	var list struct {
 		Items []struct {
 			Metadata struct {
@@ -130,7 +262,7 @@ func pods(t *testing.T, ns, label string) []string {
 		} `json:"items"`
 	}
 	if err := json.Unmarshal([]byte(out), &list); err != nil {
-		t.Fatalf("pods: %v", err)
+		e.t.Fatalf("pods: %v", err)
 	}
 	var names []string
 	for _, it := range list.Items {
@@ -139,6 +271,19 @@ func pods(t *testing.T, ns, label string) []string {
 		}
 	}
 	return names
+}
+
+// restarts sums the container restarts of the pods matching label in ns.
+func (e *scenario) restarts(ns, label string) int {
+	e.t.Helper()
+	out := kubectl(e.t, "-n", ns, "get", "pods", "-l", label, "-o",
+		"jsonpath={range .items[*]}{.status.containerStatuses[*].restartCount}{\" \"}{end}")
+	n := 0
+	for _, f := range strings.Fields(out) {
+		v, _ := strconv.Atoi(f)
+		n += v
+	}
+	return n
 }
 
 // ---- agent summary ---------------------------------------------------------------
@@ -209,16 +354,16 @@ type summary struct {
 	} `json:"resources"`
 }
 
-// latestSummary returns the newest summary line of the agent pod(s).
-func latestSummary(t *testing.T) (summary, bool) { return latestSummaryOf(t, agentDS) }
+// latest returns the newest summary of the scenario's agent.
+func (e *scenario) latest() (summary, bool) { return e.latestOf(agentDS) }
 
-// latestSummaryOf returns the newest summary of the agent DaemonSet app.
-func latestSummaryOf(t *testing.T, app string) (summary, bool) {
-	t.Helper()
+// latestOf returns the newest summary of the agent DaemonSet app.
+func (e *scenario) latestOf(app string) (summary, bool) {
+	e.t.Helper()
 	var best summary
 	found := false
-	for _, p := range pods(t, agentNS, "app="+app) {
-		out, err := kubectlErr("-n", agentNS, "logs", p, "--tail=50")
+	for _, p := range e.pods(e.agentNS, "app="+app) {
+		out, err := kubectlErr("-n", e.agentNS, "logs", p, "--tail=20")
 		if err != nil {
 			continue
 		}
@@ -238,27 +383,27 @@ func latestSummaryOf(t *testing.T, app string) (summary, bool) {
 	return best, found
 }
 
-// waitSummary polls until pred holds for the latest summary.
-func waitSummary(t *testing.T, timeout time.Duration, what string, pred func(summary) bool) summary {
-	t.Helper()
-	return waitSummaryOf(t, agentDS, timeout, what, pred)
+// wait polls until pred holds for the latest summary.
+func (e *scenario) wait(timeout time.Duration, what string, pred func(summary) bool) summary {
+	e.t.Helper()
+	return e.waitOf(agentDS, timeout, what, pred)
 }
 
-func waitSummaryOf(t *testing.T, app string, timeout time.Duration, what string, pred func(summary) bool) summary {
-	t.Helper()
+func (e *scenario) waitOf(app string, timeout time.Duration, what string, pred func(summary) bool) summary {
+	e.t.Helper()
 	deadline := time.Now().Add(timeout)
 	var last summary
 	for time.Now().Before(deadline) {
-		if s, ok := latestSummaryOf(t, app); ok {
+		if s, ok := e.latestOf(app); ok {
 			last = s
 			if pred(s) {
 				return s
 			}
 		}
-		time.Sleep(time.Second)
+		time.Sleep(500 * time.Millisecond)
 	}
 	b, _ := json.MarshalIndent(last, "", "  ")
-	t.Fatalf("timed out after %v waiting for %s (%s); last summary:\n%s", timeout, what, app, b)
+	e.t.Fatalf("timed out after %v waiting for %s (%s); last summary:\n%s", timeout, what, app, b)
 	return last
 }
 
@@ -272,8 +417,8 @@ func byPod(s summary) map[string]clientSummary {
 	return m
 }
 
-// allAttached: every running client pod is attached, owned and acking.
-func allAttached(t *testing.T, want []string) func(summary) bool {
+// allAttached: every listed client pod is attached, owned and acking.
+func allAttached(want []string) func(summary) bool {
 	return func(s summary) bool {
 		m := byPod(s)
 		for _, p := range want {
@@ -344,12 +489,7 @@ type clientEvent struct {
 	Total        uint64  `json:"total"`
 }
 
-func clientEvents(t *testing.T, pod string) []clientEvent {
-	t.Helper()
-	out, err := kubectlErr("-n", clientNS, "logs", pod)
-	if err != nil {
-		t.Fatalf("logs %s: %v", pod, err)
-	}
+func parseEvents(out string) []clientEvent {
 	var evs []clientEvent
 	for _, line := range strings.Split(out, "\n") {
 		var e clientEvent
@@ -360,38 +500,32 @@ func clientEvents(t *testing.T, pod string) []clientEvent {
 	return evs
 }
 
-// allClientEvents also includes the previous container's log (a client
-// killed and restarted in place).
-func allClientEvents(t *testing.T, pod string) []clientEvent {
-	t.Helper()
-	var evs []clientEvent
-	for _, prev := range []bool{true, false} {
-		args := []string{"-n", clientNS, "logs", pod}
-		if prev {
-			args = append(args, "--previous")
-		}
-		out, err := kubectlErr(args...)
-		if err != nil {
-			if prev {
-				continue
-			}
-			t.Fatalf("logs %s: %v", pod, err)
-		}
-		for _, line := range strings.Split(out, "\n") {
-			var e clientEvent
-			if json.Unmarshal([]byte(line), &e) == nil && e.Ev != "" {
-				evs = append(evs, e)
-			}
-		}
+// events returns the client pod's log events (current container).
+func (e *scenario) events(pod string) []clientEvent {
+	e.t.Helper()
+	out, err := kubectlErr("-n", e.clientNS, "logs", pod)
+	if err != nil {
+		e.t.Fatalf("logs %s: %v", pod, err)
 	}
-	return evs
+	return parseEvents(out)
 }
 
-func leaseEvents(t *testing.T, pod string, expired bool) []clientEvent {
+// allEvents also includes the previous container's log (a client killed and
+// restarted in place).
+func (e *scenario) allEvents(pod string) []clientEvent {
+	e.t.Helper()
+	var evs []clientEvent
+	if out, err := kubectlErr("-n", e.clientNS, "logs", pod, "--previous"); err == nil {
+		evs = parseEvents(out)
+	}
+	return append(evs, e.events(pod)...)
+}
+
+func (e *scenario) leaseEvents(pod string, expired bool) []clientEvent {
 	var out []clientEvent
-	for _, e := range clientEvents(t, pod) {
-		if e.Ev == "lease" && e.Expired != nil && (*e.Expired == 1) == expired {
-			out = append(out, e)
+	for _, ev := range e.events(pod) {
+		if ev.Ev == "lease" && ev.Expired != nil && (*ev.Expired == 1) == expired {
+			out = append(out, ev)
 		}
 	}
 	return out
@@ -410,76 +544,6 @@ func nodeExec(t *testing.T, node string, args ...string) string {
 		t.Fatalf("docker exec %s %v: %v\n%s", node, args, err, out)
 	}
 	return string(out)
-}
-
-// ---- variants -------------------------------------------------------------------
-
-// variantDoc renders the base client Deployment (or agent DaemonSet) under
-// another name and app label.
-func variantDoc(t *testing.T, ns, kind, base, name string) string {
-	t.Helper()
-	for _, doc := range strings.Split(part(manifests(t), ns), "\n---\n") {
-		if strings.Contains(doc, "kind: "+kind+"\n") {
-			doc = strings.ReplaceAll(doc, "name: "+base+"\n", "name: "+name+"\n")
-			return strings.ReplaceAll(doc, "app: "+base+"\n", "app: "+name+"\n")
-		}
-	}
-	t.Fatalf("no %s in the %s manifests", kind, ns)
-	return ""
-}
-
-func nsDoc(t *testing.T, ns string) string {
-	t.Helper()
-	return strings.Split(part(manifests(t), ns), "\n---\n")[0]
-}
-
-// deployVariant runs replicas of the test client as a Deployment of its own,
-// with args and optional strategic-merge patches. It returns the running pods,
-// or the error if the rollout fails.
-func deployVariant(t *testing.T, name string, replicas int, args []string, patches ...string) ([]string, error) {
-	t.Helper()
-	return deployVariantWithin(t, 180*time.Second, name, replicas, args, patches...)
-}
-
-func deployVariantWithin(t *testing.T, timeout time.Duration, name string, replicas int, args []string, patches ...string) ([]string, error) {
-	t.Helper()
-	apply(t, nsDoc(t, clientNS))
-	// Created with no replicas, so nothing runs before args and patches apply.
-	doc := regexp.MustCompile(`(?m)^  replicas: \d+$`).ReplaceAllString(variantDoc(t, clientNS, "Deployment", clientDP, name), "  replicas: 0")
-	apply(t, doc)
-	obj := "deployment/" + name
-	setArgs(t, clientNS, obj, args)
-	for _, p := range patches {
-		kubectl(t, "-n", clientNS, "patch", obj, "-p", p)
-	}
-	kubectl(t, "-n", clientNS, "scale", obj, fmt.Sprintf("--replicas=%d", replicas))
-	if out, err := kubectlErr("-n", clientNS, "rollout", "status", obj, fmt.Sprintf("--timeout=%ds", int(timeout.Seconds()))); err != nil {
-		return nil, fmt.Errorf("%v: %s", err, out)
-	}
-	return pods(t, clientNS, "app="+name), nil
-}
-
-// deployAgentVariant runs another agent DaemonSet (S13).
-func deployAgentVariant(t *testing.T, name string, args ...string) {
-	t.Helper()
-	apply(t, variantDoc(t, agentNS, "DaemonSet", agentDS, name))
-	if len(args) > 0 {
-		setArgs(t, agentNS, "daemonset/"+name, args)
-	}
-	kubectl(t, "-n", agentNS, "rollout", "status", "daemonset/"+name, "--timeout=120s")
-}
-
-// restarts sums the container restarts of the pods matching label.
-func restarts(t *testing.T, ns, label string) int {
-	t.Helper()
-	out := kubectl(t, "-n", ns, "get", "pods", "-l", label, "-o",
-		"jsonpath={range .items[*]}{.status.containerStatuses[*].restartCount}{\" \"}{end}")
-	n := 0
-	for _, f := range strings.Fields(out) {
-		v, _ := strconv.Atoi(f)
-		n += v
-	}
-	return n
 }
 
 // sameProcess reports whether pid on the node is still the process that
@@ -519,4 +583,13 @@ func getenv(k, def string) string {
 		return v
 	}
 	return def
+}
+
+func contains(xs []string, x string) bool {
+	for _, v := range xs {
+		if v == x {
+			return true
+		}
+	}
+	return false
 }

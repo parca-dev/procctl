@@ -1,7 +1,9 @@
 name: e2e-kind
 
 # The end-to-end scenarios (plan §7) on a single-node kind cluster:
-# {amd64, arm64} × {oldest supported, latest} Kubernetes.
+# {amd64, arm64} × {oldest supported, latest} Kubernetes. Scenarios run in
+# parallel, each with its own namespaces and consumer; the full-size variants
+# (E2E_LONG) run nightly.
 
 on:
   pull_request:
@@ -33,7 +35,7 @@ jobs:
           - arch: arm64
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 50
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
@@ -48,7 +50,7 @@ jobs:
         run: make kernel-report
       - name: Build the test images
         run: make images
-      - name: Scenarios S1–S16
+      - name: Scenarios S1–S16 (parallel)
         env:
           E2E_KIND_IMAGE: kindest/node:${{ matrix.k8s }}
           E2E_KEEP_CLUSTER: "1" # for the logs below; the runner is discarded anyway
@@ -56,7 +58,7 @@ jobs:
           mkdir -p artifacts
           cd e2e
           set -o pipefail
-          go test -count=1 -timeout 45m -v ./... 2>&1 | tee ../artifacts/e2e.log
+          go test -count=1 -timeout 20m -parallel 8 -v ./... 2>&1 | tee ../artifacts/e2e.log
       - name: Summary
         if: always()
         run: |

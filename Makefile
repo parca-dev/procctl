@@ -7,7 +7,7 @@ SAN    := -fsanitize=address,undefined -fno-sanitize-recover=all
 generate:
 	scripts/gen-types.sh
 
-.PHONY: images e2e-kind generate all test test-c test-c-compile test-go test-hello bench fuzz-go fuzz-c model-long kernel-report demo clean
+.PHONY: images e2e-kind e2e-kind-long generate all test test-c test-c-compile test-go test-hello bench fuzz-go fuzz-c model-long kernel-report demo clean
 
 all: $(BIN)/echo-client $(BIN)/echo-agent
 
@@ -80,7 +80,12 @@ images:
 # E2E_KEEP_CLUSTER=1 keeps it afterwards; E2E_KIND_IMAGE=kindest/node:v1.35.0
 # picks the Kubernetes version of a new one). CI: .github/workflows/e2e-kind.yml.
 e2e-kind: images
-	cd e2e && go test -count=1 -timeout 45m -v ./...
+	cd e2e && go test -count=1 -timeout 20m -parallel 8 -v ./...
+
+# The full-size variants (nightly): S6 200 clients, S9 5000 processes, a 10 min
+# lone holder, S14 with 8 and 50 clients.
+e2e-kind-long: images
+	cd e2e && E2E_LONG=1 go test -count=1 -timeout 75m -parallel 4 -v ./...
 
 demo: all
 	examples/echo/demo.sh

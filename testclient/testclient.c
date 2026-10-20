@@ -44,6 +44,9 @@ static pthread_mutex_t g_st_mu = PTHREAD_MUTEX_INITIALIZER;
 static uint8_t g_token_id[16];
 static long g_acquire_ms = 300;
 static int g_holder_hang;
+/* Consumer name: e2e scenarios share a node, each with its own consumer and
+ * agent, so they can't see each other's clients. */
+static const char *g_consumer = TESTCLIENT_CONSUMER;
 static pthread_mutex_t g_out_mu = PTHREAD_MUTEX_INITIALIZER;
 
 static void logj(const char *ev, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
@@ -163,7 +166,8 @@ static int hostile(const char *mode) {
     return 2;
   }
 #define MODE(m) (!strcmp(mode, m))
-  const char *name = "procctl:" TESTCLIENT_CONSUMER "-v1";
+  char name[64];
+  snprintf(name, sizeof name, "procctl:%s-v1", g_consumer);
   int fd = (int)syscall(SYS_memfd_create, name, MFD_CLOEXEC | MFD_ALLOW_SEALING);
   if (fd < 0 || ftruncate(fd, (off_t)total) != 0) {
     logj("hostile_failed", "\"errno\":%d", errno);
@@ -192,8 +196,8 @@ static int hostile(const char *mode) {
   h.header_size = (uint32_t)sizeof h;
   h.total_size = MODE("wrong-size") ? total + (size_t)P : total;
   h.page_size = (uint32_t)P;
-  memcpy(h.consumer, MODE("spoof-name") ? "other" : TESTCLIENT_CONSUMER,
-         strlen(MODE("spoof-name") ? "other" : TESTCLIENT_CONSUMER));
+  const char *hc = MODE("spoof-name") ? "other" : g_consumer;
+  memcpy(h.consumer, hc, strnlen(hc, sizeof h.consumer - 1));
   h.schema_version = TESTCLIENT_SCHEMA_VERSION;
   h.creator_pid = MODE("spoof-pid") ? 4242 : (uint32_t)getpid(); /* informational only */
   h.agent_area_off = MODE("bad-offsets") ? 2 * (uint64_t)P : (uint64_t)P;
@@ -253,7 +257,7 @@ static int noise(long procs, long fds, long exec_rate, const char *self) {
     }
     usleep((useconds_t)(1000000 / exec_rate));
     uint64_t now = procctl_now_ns();
-    if (now - last_log > 10000000000ull) {
+    if (now - last_log > 2000000000ull) {
       logj("execs", "\"total\":%llu", (unsigned long long)execs);
       last_log = now;
     }
@@ -307,9 +311,10 @@ int main(int argc, char **argv) {
     else if (!strcmp(name, "--noise-fds")) noise_fds = atol(NEXT());
     else if (!strcmp(name, "--exec-rate")) exec_rate = atol(NEXT());
     else if (!strcmp(name, "--noop")) return 0;
+    else if (!strcmp(name, "--consumer")) g_consumer = NEXT();
     else {
       fprintf(stderr, "usage: %s [--poll-us N] [--exclusive [--acquire-ms N] [--holder-hang]] [--exit-after-s N]"
-              " [--init-delay-ms N] [--fork-after-ms N [--fork-workers K] [--fork-reinit]]\n"
+              " [--init-delay-ms N] [--fork-after-ms N [--fork-workers K] [--fork-reinit]] [--consumer NAME]\n"
               "       %s --hostile=MODE\n"
               "       %s --noise-procs=N [--noise-fds=M] [--exec-rate=R]\n",
               argv[0], argv[0], argv[0]);
@@ -331,7 +336,7 @@ int main(int argc, char **argv) {
   uint64_t t_exec = procctl_now_ns();
   if (init_delay_ms > 0) usleep((useconds_t)init_delay_ms * 1000);
 
-  procctl_config_t cfg = {.consumer = TESTCLIENT_CONSUMER,
+  procctl_config_t cfg = {.consumer = g_consumer,
                           .schema_version = TESTCLIENT_SCHEMA_VERSION,
                           .payload_capacity = PAYLOAD_CAP,
                           .resource_slots = SLOTS,

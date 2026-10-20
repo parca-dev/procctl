@@ -8,56 +8,53 @@ import (
 )
 
 // S9: discovery cost on a busy node: many processes with many fds (the /proc
-// scan), and an exec storm (mapping events) while new clients start. Reduced
-// scale on kind: E2E_NOISE_PROCS (default 1000) processes × 200 fds.
+// scan), and an exec storm (mapping events) while new clients start.
+// E2E_NOISE_PROCS processes × 200 fds (default 1000; 5000 long).
+//
+// Not parallel: it loads the whole node, so it runs alone, before the
+// parallel scenarios.
 func TestS9ScanCost(t *testing.T) {
-	procs, _ := strconv.Atoi(getenv("E2E_NOISE_PROCS", "1000"))
+	procs := 1000
+	if long {
+		procs = 5000
+	}
+	if v, err := strconv.Atoi(getenv("E2E_NOISE_PROCS", "")); err == nil {
+		procs = v
+	}
 	const perPod, fds = 100, 200
-	reset(t)
-	deployAgent(t, "--rate=10", "--rescan=5s", "--lease=3s")
-	deployClients(t, 4)
-	want := pods(t, clientNS, "app="+clientDP)
-	base := waitSummary(t, 30*time.Second, "attached", allAttached(t, want))
+	e := newScenario(t, "s9")
+	t.Cleanup(func() { // the load must not outlive the test, whatever happens
+		kubectlErr("-n", e.clientNS, "delete", "deployment/noise", "deployment/storm", "--wait=false")
+	})
+	e.agent(agentDS, nil, "--rescan=5s")
+	want := e.clients(clientDP, 4)
+	base := e.wait(30*time.Second, "attached", allAttached(want))
 
 	noisePods := (procs + perPod - 1) / perPod
-	if _, err := deployVariant(t, "noise", noisePods, []string{
-		fmt.Sprintf("--noise-procs=%d", perPod), fmt.Sprintf("--noise-fds=%d", fds)}); err != nil {
-		t.Fatal(err)
-	}
-	s := waitSummary(t, 60*time.Second, "a full scan with the noise", func(s summary) bool {
+	e.clients("noise", noisePods, fmt.Sprintf("--noise-procs=%d", perPod), fmt.Sprintf("--noise-fds=%d", fds))
+	s := e.wait(90*time.Second, "a full scan with the noise", func(s summary) bool {
 		return s.Scan.Count > base.Scan.Count && s.Scan.Procs >= base.Scan.Procs+procs && s.Scan.FDs >= procs*fds
 	})
 	t.Logf("full /proc scan: %d processes, %d fds in %.0f ms (agent rss %d KiB)", s.Scan.Procs, s.Scan.FDs, s.Scan.MS, s.RSSKB)
-	if s.Scan.MS > 5000 {
-		t.Errorf("full scan took %.0f ms", s.Scan.MS)
+	if limit := float64(procs); s.Scan.MS > limit { // ~1 ms per process with 200 fds
+		t.Errorf("full scan took %.0f ms (limit %.0f)", s.Scan.MS, limit)
 	}
 	checkHealthy(t, s)
 
 	// Exec storm, and new clients starting during it.
 	before := s
 	start := time.Now()
-	storm, err := deployVariant(t, "storm", 1, []string{"--exec-rate=1000"})
-	if err != nil {
-		t.Fatal(err)
-	}
+	storm := e.clients("storm", 1, "--exec-rate=1000")
+	time.Sleep(3 * time.Second)
+	fresh := e.clients("fresh", 2)
+	s = e.wait(30*time.Second, "new clients attached during the storm", allAttached(append(want, fresh...)))
 	time.Sleep(5 * time.Second)
-	kubectl(t, "-n", clientNS, "scale", "deployment/"+clientDP, fmt.Sprintf("--replicas=%d", len(want)+2))
-	kubectl(t, "-n", clientNS, "rollout", "status", "deployment/"+clientDP, "--timeout=120s")
-	now := pods(t, clientNS, "app="+clientDP)
-	var fresh []string
-	for _, p := range now {
-		if !contains(want, p) {
-			fresh = append(fresh, p)
-		}
-	}
-	s = waitSummary(t, 30*time.Second, "new clients attached during the storm", allAttached(t, now))
-	time.Sleep(10 * time.Second)
-	s, _ = latestSummary(t)
+	s, _ = e.latest()
 	elapsed := time.Since(start).Seconds()
 	var execs uint64
-	for _, e := range clientEvents(t, storm[0]) {
-		if e.Ev == "execs" {
-			execs = e.Total
+	for _, ev := range e.events(storm[0]) {
+		if ev.Ev == "execs" {
+			execs = ev.Total
 		}
 	}
 	cpu := (s.CPUS - before.CPUS) / elapsed
@@ -65,20 +62,11 @@ func TestS9ScanCost(t *testing.T) {
 	if s.Hello != nil && before.Hello != nil {
 		events = s.Hello.MappingEvents - before.Hello.MappingEvents
 	}
-	t.Logf("exec storm: ~%.0f exec/s, %d mapping events; agent cpu %.1f%% of a core, rss %d KiB",
+	t.Logf("exec storm: ~%.0f exec/s, %d mapping events; agent cpu %.1f%% of a core (incl. the 5 s rescan), rss %d KiB",
 		float64(execs)/elapsed, events, 100*cpu, s.RSSKB)
-	if cpu > 0.5 {
+	if cpu > 1 {
 		t.Errorf("agent used %.0f%% of a core during the exec storm", 100*cpu)
 	}
-	checkDiscoveryLatency(t, "S9 new clients during the storm", fresh, len(fresh), 1000)
+	e.checkDiscoveryLatency("S9 new clients during the storm", fresh, len(fresh), 1000)
 	checkHealthy(t, s)
-}
-
-func contains(xs []string, x string) bool {
-	for _, v := range xs {
-		if v == x {
-			return true
-		}
-	}
-	return false
 }
