@@ -35,15 +35,11 @@ func TestGeneratedTypesUpToDate(t *testing.T) {
 // ---- stress: Go writer ↔ C readers, C state writer ↔ Go reader ------------------
 
 type stressStats struct {
-	Polls      uint64 `json:"polls"`
-	Changes    uint64 `json:"changes"`
-	Busy       uint64 `json:"busy"`
-	Bad        uint64 `json:"bad"`
-	Backwards  uint64 `json:"backwards"`
-	GrantReads uint64 `json:"grant_reads"`
-	GrantBad   uint64 `json:"grant_bad"`
-	GrantBusy  uint64 `json:"grant_busy"`
-	GrantOther int    `json:"grant_other"`
+	Polls     uint64 `json:"polls"`
+	Changes   uint64 `json:"changes"`
+	Busy      uint64 `json:"busy"`
+	Bad       uint64 `json:"bad"`
+	Backwards uint64 `json:"backwards"`
 }
 
 func stressPattern(tag uint64, i int) byte {
@@ -100,7 +96,7 @@ func TestStress(t *testing.T) {
 		t.Cleanup(func() { _ = cmd.Process.Kill(); _, _ = cmd.Process.Wait() })
 	}
 
-	id, _ := NewIdentity()
+	id := NewOwnerID()
 	var wg sync.WaitGroup
 	var writes, stateReads, stateBusy atomic.Uint64
 	stop := make(chan struct{})
@@ -119,7 +115,7 @@ func TestStress(t *testing.T) {
 				fd = c.FD
 			}
 		}
-		c, err := Attach(p.cmd.Process.Pid, fd, AttachOptions{Identity: id, Lease: time.Minute})
+		c, err := Attach(p.cmd.Process.Pid, fd, AttachOptions{OwnerID: id, Lease: time.Minute})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -134,22 +130,14 @@ func TestStress(t *testing.T) {
 					return
 				default:
 				}
-				size := 12 + rng.Intn(c.Info().PayloadCap-12)
+				size := 12 + rng.Intn(c.Info().Header.PayloadCapacity()-12)
 				buf := make([]byte, size)
 				le.PutUint64(buf, tag)
 				le.PutUint32(buf[8:], uint32(size))
 				for j := 12; j < size; j++ {
 					buf[j] = stressPattern(tag, j)
 				}
-				var grants []Grant
-				for s := 0; s < rng.Intn(5); s++ {
-					var gid [16]byte
-					for k := range gid {
-						gid[k] = byte(s + 1)
-					}
-					grants = append(grants, Grant{Kind: 7, ID: gid, Duration: 1000 + uint64(s+1)})
-				}
-				if _, _, err := c.Write(buf, grants); err != nil {
+				if _, err := c.Write(buf); err != nil {
 					fail("write: %v", err)
 					return
 				}
@@ -211,22 +199,16 @@ func TestStress(t *testing.T) {
 		total.Busy += st.Busy
 		total.Bad += st.Bad
 		total.Backwards += st.Backwards
-		total.GrantReads += st.GrantReads
-		total.GrantBad += st.GrantBad
-		total.GrantBusy += st.GrantBusy
-		if st.GrantOther != 0 {
-			total.GrantOther = st.GrantOther
-		}
 	}
-	t.Logf("%ds, %d processes: Go wrote %d generations; C polled %d times, applied %d, busy %d, grant reads %d; Go state reads %d (busy %d)",
-		secs, n, writes.Load(), total.Polls, total.Changes, total.Busy, total.GrantReads, stateReads.Load(), stateBusy.Load())
-	if total.Bad != 0 || total.Backwards != 0 || total.GrantBad != 0 {
+	t.Logf("%ds, %d processes: Go wrote %d generations; C polled %d times, applied %d, busy %d; Go state reads %d (busy %d)",
+		secs, n, writes.Load(), total.Polls, total.Changes, total.Busy, stateReads.Load(), stateBusy.Load())
+	if total.Bad != 0 || total.Backwards != 0 {
 		t.Errorf("C readers accepted torn data: %+v", total)
 	}
 	if len(failures) > 0 {
 		t.Errorf("Go side: %d failures, first: %s", len(failures), failures[0])
 	}
-	if total.Changes < 1000 || stateReads.Load() < 1000 || total.GrantReads < 1000 {
+	if total.Changes < 1000 || stateReads.Load() < 1000 {
 		t.Errorf("stress did no work: %+v", total)
 	}
 

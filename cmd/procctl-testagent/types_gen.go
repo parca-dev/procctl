@@ -9,34 +9,21 @@ type payloadHeader struct {
 	Seq_tag        uint64
 	Agent_write_ns uint64
 	Pattern_len    uint32
-	Pattern_crc32c uint32
+	Reserved       uint32
 }
 type clientStatus struct {
-	Last_seq_tag         uint64
-	Last_gen             uint64
-	Last_agent_write_ns  uint64
-	Last_recv_ns         uint64
-	Torn                 uint64
-	Backwards            uint64
-	Redelivered          uint64
-	Polls                uint64
-	Changes              uint64
-	Busy                 uint64
-	Lease_expired_at_ns  uint64
-	Lease_restored_at_ns uint64
-	Start_time           uint64
-	Acquires             uint64
-	Releases             uint64
-	Ns_pid               int32
-	Lease_expired        uint32
-	Holding              uint32
-	Mode                 uint32
-	Pod                  [64]uint8
+	Last_seq_tag        uint64
+	Last_gen            uint64
+	Last_agent_write_ns uint64
+	Last_recv_ns        uint64
+	Torn                uint64
+	Backwards           uint64
+	Redelivered         uint64
+	Changes             uint64
+	Start_time          uint64
+	Ns_pid              int32
+	Lease_expired       uint32
+	Pod                 [64]uint8
 }
 
-const (
-	consumerName  = "testclient"
-	schemaVersion = 0x1
-	kindToken     = 0x1
-	modeExclusive = 0x1
-)
+const consumerName = "testclient"

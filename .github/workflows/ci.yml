@@ -32,22 +32,12 @@ jobs:
           go-version-file: go.mod
       - name: Install compilers
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang
-      - name: Kernel and feature report
-        run: make -s kernel-report | tee -a "$GITHUB_STEP_SUMMARY"
-      - name: types_gen.go matches c/procctl.h (go tool cgo -godefs)
+      - name: Generated Go types match the C headers
         run: scripts/gen-types.sh --check
-      - name: procctl.h compile matrix (gcc/clang, C/C++, system/bundled sdt.h)
-        run: make -s test-c-compile
-      - name: C unit tests (ASan/UBSan)
+      - name: C (gcc/clang, C/C++; unit tests under ASan/UBSan)
         run: make -s test-c
-      - name: Go vet
-        run: go vet ./...
-      # Fuzz seed corpora, a 3 s stress and 200 model schedules; the long
-      # versions (fuzzing, 15 min stress, 5000 schedules) run nightly.
-      - name: Go tests (-race; interop, conformance, stress smoke, arbiter model and real holders)
-        run: go test -race -count=1 -timeout 20m ./...
-      - name: hello watcher as root (uprobes, mmap2 events, pid-namespace translation)
-        run: make test-hello
+      - name: Go (vet; -race; interop with C processes, stress)
+        run: make -s test-go
       - name: poll() benchmark
         run: |
           {

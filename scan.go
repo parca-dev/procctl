@@ -16,7 +16,7 @@ type Candidate struct {
 	HostPID  int
 	FD       int
 	Consumer string
-	Major    int
+	Version  int
 	Key      Key // from stat(2) through the /proc fd link
 }
 
@@ -34,7 +34,7 @@ type ScanStats struct {
 	Duration   time.Duration
 }
 
-// Scan walks /proc/*/fd for procctl memfds (SPEC §10.1).
+// Scan walks /proc/*/fd for procctl memfds.
 func Scan(ctx context.Context, opt ScanOptions) ([]Candidate, ScanStats, error) {
 	if opt.ProcRoot == "" {
 		opt.ProcRoot = "/proc"
@@ -75,12 +75,12 @@ func Scan(ctx context.Context, opt ScanOptions) ([]Candidate, ScanStats, error) 
 			if err != nil || len(link) < len(memfdPrefix) || link[:len(memfdPrefix)] != memfdPrefix {
 				continue
 			}
-			consumer, major, ok := parseMemfdName(link)
+			consumer, version, ok := parseMemfdName(link)
 			if !ok || (opt.Consumer != "" && consumer != opt.Consumer) {
 				continue
 			}
 			fd, _ := strconv.Atoi(n)
-			c := Candidate{HostPID: pid, FD: fd, Consumer: consumer, Major: major}
+			c := Candidate{HostPID: pid, FD: fd, Consumer: consumer, Version: version}
 			var st syscall.Stat_t
 			if syscall.Stat(dir+"/"+n, &st) == nil {
 				c.Key = Key{Dev: uint64(st.Dev), Ino: st.Ino}

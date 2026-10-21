@@ -1,4 +1,4 @@
-// Package e2e runs the procctl end-to-end scenarios (plan §7) against a
+// Package e2e runs the procctl end-to-end scenarios against a
 // Kubernetes cluster.
 //
 // By default it creates (or reuses) a kind cluster named procctl-e2e and loads

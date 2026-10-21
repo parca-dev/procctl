@@ -1,10 +1,8 @@
 name: e2e-kind
 
-# The end-to-end scenarios (plan §7) on a single-node kind cluster:
-# {amd64, arm64} × {oldest supported, latest} Kubernetes. Scenarios run in
-# parallel, each with its own namespaces and consumer; the full-size variants
-# (E2E_LONG) run nightly. 4 at a time: 4-core runners; pod starts slow down
-# beyond leases with more.
+# The end-to-end scenarios on a one-node kind cluster: {amd64, arm64} ×
+# {oldest supported, latest} Kubernetes. Scenarios run in parallel, each with
+# its own namespaces and consumer.
 
 on:
   pull_request:
@@ -47,11 +45,9 @@ jobs:
             e2e/go.sum
       - name: Install kind
         run: go install sigs.k8s.io/kind@${KIND_VERSION}
-      - name: Kernel and feature report
-        run: make kernel-report
       - name: Build the test images
         run: make images
-      - name: Scenarios S1–S16 (parallel)
+      - name: Scenarios
         env:
           E2E_KIND_IMAGE: kindest/node:${{ matrix.k8s }}
           E2E_KEEP_CLUSTER: "1" # for the logs below; the runner is discarded anyway

@@ -121,7 +121,6 @@ func startAgent(t *testing.T, consumer string, lease time.Duration) *agent {
 	ctx, cancel := context.WithCancel(context.Background())
 	a := &agent{reg: reg, cancel: cancel, done: make(chan struct{})}
 	go func() { _ = reg.Run(ctx); close(a.done) }()
-	<-reg.FirstScanDone()
 	return a
 }
 
@@ -152,11 +151,8 @@ func TestEchoRoundTrip(t *testing.T) {
 	if !c.Owned() {
 		t.Fatal("not owner")
 	}
-	if c.Info().AttachPath != "pidfd_getfd" {
-		t.Errorf("attach path %s", c.Info().AttachPath)
-	}
 	for i := 0; i < 20; i++ {
-		gen, _, err := c.Write([]byte("hello"), nil)
+		gen, err := c.Write([]byte("hello"))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -174,8 +170,8 @@ func TestEchoRoundTrip(t *testing.T) {
 		}
 	}
 	p.waitLine(t, "config gen=40: hello", 2*time.Second)
-	// A nil payload clears the configuration.
-	if _, _, err := c.Write(nil, nil); err != nil {
+	// An empty payload clears the configuration.
+	if _, err := c.Write(nil); err != nil {
 		t.Fatal(err)
 	}
 	p.waitLine(t, "none (agent cleared config)", 2*time.Second)
@@ -188,7 +184,7 @@ func TestUninstallRevertsImmediately(t *testing.T) {
 	clientFor(t, a.reg, p.cmd.Process.Pid)
 	p.waitLine(t, "agent lease active", 2*time.Second)
 	before := p.linesContaining("using defaults")
-	a.reg.Close(ReleaseLeases(true))
+	a.reg.Uninstall()
 	a.stop()
 	deadline := time.Now().Add(time.Second) // far below the 10 s lease
 	for p.linesContaining("using defaults") == before {
@@ -204,7 +200,7 @@ func TestReleasedHandoverKeepsConfig(t *testing.T) {
 	p := startProc(t, bin, "--interval-ms", "5")
 	a1 := startAgent(t, "echo", 2*time.Second)
 	c1 := clientFor(t, a1.reg, p.cmd.Process.Pid)
-	gen, _, err := c1.Write([]byte("v1"), nil)
+	gen, err := c1.Write([]byte("v1"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -223,7 +219,7 @@ func TestReleasedHandoverKeepsConfig(t *testing.T) {
 	if !c2.Owned() {
 		t.Fatal("successor did not claim a RELEASED region")
 	}
-	gen2, _, err := c2.Write([]byte("v2"), nil)
+	gen2, err := c2.Write([]byte("v2"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -259,11 +255,11 @@ func TestTwoAgentsOneOwner(t *testing.T) {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	if _, _, err := c2.Write([]byte("x"), nil); !errors.Is(err, ErrNotOwner) {
+	if _, err := c2.Write([]byte("x")); !errors.Is(err, ErrNotOwner) {
 		t.Fatalf("passive agent write: %v", err)
 	}
 
-	// The owner hangs (no heartbeats): the other claims after one lease (rule 4).
+	// The owner hangs (no heartbeats): the other claims after one lease.
 	a1.stop()
 	deadline := time.Now().Add(3 * time.Second)
 	for !c2.Owned() {
@@ -272,7 +268,7 @@ func TestTwoAgentsOneOwner(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	if _, _, err := c1.Write([]byte("stale owner"), nil); !errors.Is(err, ErrPreempted) && !errors.Is(err, ErrNotOwner) {
+	if _, err := c1.Write([]byte("stale owner")); !errors.Is(err, ErrPreempted) && !errors.Is(err, ErrNotOwner) {
 		t.Fatalf("former owner could still write: %v", err)
 	}
 }
@@ -286,13 +282,13 @@ func TestForkChildStateIsStale(t *testing.T) {
 	p.mu.Lock()
 	for _, l := range p.lines {
 		if i := strings.Index(l, "forked child pid="); i >= 0 {
-			_, _ = fmtSscan(l[i+len("forked child pid="):], &child)
+			child, _ = strconv.Atoi(strings.Fields(l[i+len("forked child pid="):])[0])
 		}
 	}
 	p.mu.Unlock()
 	t.Cleanup(func() { _ = unix.Kill(child, unix.SIGKILL) })
 
-	id, _ := NewIdentity()
+	id := NewOwnerID()
 	cands, _, err := Scan(context.Background(), ScanOptions{Consumer: "echo"})
 	if err != nil {
 		t.Fatal(err)
@@ -309,12 +305,12 @@ func TestForkChildStateIsStale(t *testing.T) {
 	if parentFD < 0 || childFD < 0 {
 		t.Fatalf("expected the region in both parent and child: %+v", cands)
 	}
-	pc, err := Attach(p.cmd.Process.Pid, parentFD, AttachOptions{Identity: id})
+	pc, err := Attach(p.cmd.Process.Pid, parentFD, AttachOptions{OwnerID: id})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer pc.Close()
-	cc, err := Attach(child, childFD, AttachOptions{Identity: id})
+	cc, err := Attach(child, childFD, AttachOptions{OwnerID: id})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -371,134 +367,5 @@ func TestForkReinitGetsOwnRegion(t *testing.T) {
 		if err != nil || st.Stale {
 			t.Fatalf("pid %d: state %+v err %v", c.Info().HostPID, st, err)
 		}
-	}
-}
-
-func TestGrantWakesControlThread(t *testing.T) {
-	bin := buildC(t, "c/tests/wait_client.c")
-	p := startProc(t, bin)
-	a := startAgent(t, "waittest", 2*time.Second)
-	defer a.reg.Close()
-	c := clientFor(t, a.reg, p.cmd.Process.Pid)
-	var id [16]byte
-	for i := range id {
-		id[i] = 0x42
-	}
-	ctx := context.Background()
-
-	waitFor := func(pred func(State) bool) (State, time.Duration) {
-		t0 := time.Now()
-		for time.Since(t0) < 2*time.Second {
-			st, err := c.ReadState(ctx)
-			if err == nil && pred(st) {
-				return st, time.Since(t0)
-			}
-			time.Sleep(200 * time.Microsecond)
-		}
-		t.Fatal("state predicate never held")
-		return State{}, 0
-	}
-	entry := func(st State) ResourceEntry {
-		for _, r := range st.Resources {
-			if r.Kind == 1 && r.ID == id {
-				return r
-			}
-		}
-		return ResourceEntry{}
-	}
-
-	gen, grants, err := c.Write(nil, []Grant{{Kind: 1, ID: id, Duration: uint64(time.Hour)}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if grants[0].GrantID != gen {
-		t.Fatalf("new grant id %d != generation %d", grants[0].GrantID, gen)
-	}
-	st, took := waitFor(func(st State) bool { e := entry(st); return e.State == ResHolding && e.GrantID == gen })
-	t.Logf("grant → HOLDING in %v (futex wake; the waiter's timeout is 250 ms)", took)
-	if took > 200*time.Millisecond {
-		t.Errorf("control thread was not woken promptly: %v", took)
-	}
-	if st.GrantsSeenGen < gen || entry(st).Flags&ResFlagWant == 0 {
-		t.Fatalf("state %+v", st)
-	}
-
-	// Revoke: an empty grant table releases.
-	rgen, _, err := c.Write(nil, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, took = waitFor(func(st State) bool {
-		e := entry(st)
-		return e.State == ResReleased && e.GrantID == gen && st.GrantsSeenGen >= rgen
-	})
-	t.Logf("revoke → RELEASED in %v", took)
-}
-
-// fmtSscan parses a leading decimal integer.
-func fmtSscan(s string, v *int) (int, error) {
-	n := 0
-	i := 0
-	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
-		n = n*10 + int(s[i]-'0')
-		i++
-	}
-	if i == 0 {
-		return 0, errors.New("no number")
-	}
-	*v = n
-	return 1, nil
-}
-
-// Every attach path × read path: pidfd_getfd or /proc/<pid>/fd, and
-// process_vm_readv or /proc/<pid>/mem (scenario S11).
-func TestAttachAndReadPaths(t *testing.T) {
-	bin := buildC(t, "examples/echo/client.c")
-	p := startProc(t, bin, "--interval-ms", "5")
-	pid := p.cmd.Process.Pid
-	var cand Candidate
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		cands, _, _ := Scan(context.Background(), ScanOptions{Consumer: "echo", PIDs: []int{pid}})
-		if len(cands) == 1 {
-			cand = cands[0]
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("region not found")
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	for _, tc := range []struct {
-		procFD, procMem  bool
-		attach, readPath string
-	}{
-		{false, false, "pidfd_getfd", "process_vm_readv"},
-		{true, false, "proc", "process_vm_readv"},
-		{false, true, "pidfd_getfd", "proc_mem"},
-		{true, true, "proc", "proc_mem"},
-	} {
-		id, _ := NewIdentity()
-		c, err := Attach(pid, cand.FD, AttachOptions{Identity: id, ForceProcFallback: tc.procFD, ForceMemFallback: tc.procMem})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if got := c.Info(); got.AttachPath != tc.attach || got.ReadPath != tc.readPath {
-			t.Errorf("paths %s/%s, want %s/%s", got.AttachPath, got.ReadPath, tc.attach, tc.readPath)
-		}
-		c.mu.Lock()
-		c.claimLocked(time.Now())
-		c.mu.Unlock()
-		gen, _, err := c.Write([]byte("paths"), nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		if err := c.WaitAck(ctx, gen); err != nil {
-			t.Errorf("%s/%s: %v", tc.attach, tc.readPath, err)
-		}
-		cancel()
-		c.release(true)
-		c.Close()
 	}
 }

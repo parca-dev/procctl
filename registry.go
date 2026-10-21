@@ -22,12 +22,8 @@ type RegistryOptions struct {
 	ReadTimeout    time.Duration // remote state reads; default 1s
 	MaxRegionSize  int64
 	Logger         *slog.Logger
-	// ForceProcFallback skips pidfd_getfd and opens /proc/<pid>/fd/<n>.
-	ForceProcFallback bool
-	// ForceMemFallback reads state blocks through /proc/<pid>/mem.
-	ForceMemFallback bool
-	// OnReject, if set, is called for every region that fails attach or
-	// validation (SPEC §10.2), e.g. to count rejections by reason.
+	// OnReject, if set, is called for every region that fails validation,
+	// e.g. to count rejections by reason.
 	OnReject func(pid, fd int, err error)
 }
 
@@ -49,23 +45,19 @@ type Event struct {
 // Registry discovers, attaches and maintains regions: it owns them,
 // heartbeats them, and detaches them when their process exits.
 type Registry struct {
-	opt    RegistryOptions
-	id     Identity
-	log    *slog.Logger
-	notify chan int
-
-	lastScan  ScanStats
-	fullScans int
-	events    chan Event
-	first     chan struct{}
-	mu        sync.Mutex
-	clients   map[Key]*Client
-	byPidfd   map[int]*Client
-	epfd      int
-	closed    bool
+	opt     RegistryOptions
+	owner   uint64
+	log     *slog.Logger
+	notify  chan int
+	events  chan Event
+	mu      sync.Mutex
+	clients map[Key]*Client
+	byPidfd map[int]*Client
+	epfd    int
+	closed  bool
 }
 
-// NewRegistry creates a registry with a fresh agent identity.
+// NewRegistry creates a registry with a fresh owner id.
 func NewRegistry(opt RegistryOptions) (*Registry, error) {
 	if opt.ProcRoot == "" {
 		opt.ProcRoot = "/proc"
@@ -79,38 +71,32 @@ func NewRegistry(opt RegistryOptions) (*Registry, error) {
 	if opt.Logger == nil {
 		opt.Logger = slog.Default()
 	}
-	id, err := NewIdentity()
-	if err != nil {
-		return nil, err
-	}
 	epfd, err := unix.EpollCreate1(unix.EPOLL_CLOEXEC)
 	if err != nil {
 		return nil, err
 	}
 	return &Registry{
 		opt:     opt,
-		id:      id,
+		owner:   NewOwnerID(),
 		log:     opt.Logger,
 		notify:  make(chan int, 64),
 		events:  make(chan Event, 256),
-		first:   make(chan struct{}),
 		clients: map[Key]*Client{},
 		byPidfd: map[int]*Client{},
 		epfd:    epfd,
 	}, nil
 }
 
-// Identity returns this agent's owner identity.
-func (r *Registry) Identity() Identity { return r.id }
+// OwnerID returns this agent's owner id.
+func (r *Registry) OwnerID() uint64 { return r.owner }
 
 // Events delivers Attached/Detached events. Events are dropped if the
 // channel is full.
 func (r *Registry) Events() <-chan Event { return r.events }
 
-// FirstScanDone is closed after the first full discovery pass (SPEC §9.2 A5).
-func (r *Registry) FirstScanDone() <-chan struct{} { return r.first }
-
-// Notify requests an immediate scan of one pid (hello probe, mapping event).
+// Notify requests an immediate scan of one pid, e.g. from a process-exec or
+// mmap event source the agent already has; otherwise new regions are found
+// by the periodic rescan.
 // It never blocks; if too many are queued, a full scan is scheduled instead.
 func (r *Registry) Notify(pid int) {
 	select {
@@ -121,14 +107,6 @@ func (r *Registry) Notify(pid int) {
 		default:
 		}
 	}
-}
-
-// LastScan returns the cost of the latest full /proc scan, and how many
-// full scans have run.
-func (r *Registry) LastScan() (ScanStats, int) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.lastScan, r.fullScans
 }
 
 // Clients returns the attached clients.
@@ -146,7 +124,6 @@ func (r *Registry) Clients() []*Client {
 func (r *Registry) Run(ctx context.Context) error {
 	go r.watchExits(ctx)
 	r.scan(ctx, 0)
-	close(r.first)
 	rescan := time.NewTicker(r.opt.RescanInterval)
 	defer rescan.Stop()
 	hb := time.NewTicker(r.opt.Lease / 4)
@@ -181,12 +158,6 @@ func (r *Registry) scan(ctx context.Context, pid int) {
 		return
 	}
 	r.log.Debug("scan", "procs", stats.Procs, "fds", stats.FDs, "took", stats.Duration, "found", len(cands))
-	if pid == 0 {
-		r.mu.Lock()
-		r.lastScan = stats
-		r.fullScans++
-		r.mu.Unlock()
-	}
 	// Several pids can hold one region (fork); prefer the lowest pid.
 	sort.Slice(cands, func(i, j int) bool { return cands[i].HostPID < cands[j].HostPID })
 	for _, cand := range cands {
@@ -196,13 +167,12 @@ func (r *Registry) scan(ctx context.Context, pid int) {
 		r.mu.Lock()
 		_, known := r.clients[cand.Key]
 		r.mu.Unlock()
-		if known || cand.Major != SpecMajor {
+		if known || cand.Version != Version {
 			continue
 		}
 		c, err := Attach(cand.HostPID, cand.FD, AttachOptions{
-			ProcRoot: r.opt.ProcRoot, MaxRegionSize: r.opt.MaxRegionSize,
-			Identity: r.id, Lease: r.opt.Lease, ReadTimeout: r.opt.ReadTimeout,
-			ForceProcFallback: r.opt.ForceProcFallback, ForceMemFallback: r.opt.ForceMemFallback,
+			OwnerID: r.owner, Lease: r.opt.Lease, ProcRoot: r.opt.ProcRoot,
+			MaxRegionSize: r.opt.MaxRegionSize, ReadTimeout: r.opt.ReadTimeout,
 		})
 		if err != nil {
 			r.log.Info("attach rejected", "pid", cand.HostPID, "fd", cand.FD, "err", err)
@@ -230,8 +200,7 @@ func (r *Registry) add(c *Client) {
 	c.mu.Lock()
 	c.claimLocked(time.Now())
 	c.mu.Unlock()
-	r.log.Info("attached", "pid", c.info.HostPID, "consumer", c.info.Header.Consumer,
-		"path", c.info.AttachPath, "owned", c.Owned())
+	r.log.Info("attached", "pid", c.info.HostPID, "consumer", c.info.Header.Consumer, "owned", c.Owned())
 	r.emit(Event{Kind: Attached, Client: c})
 }
 
@@ -277,22 +246,16 @@ func (r *Registry) emit(e Event) {
 	}
 }
 
-// CloseOption configures Registry.Close.
-type CloseOption func(*closeOpts)
+// Close gives up ownership of every region, marking it RELEASED so a
+// successor agent takes over at once while processes keep their
+// configuration, and detaches them.
+func (r *Registry) Close() error { return r.close(false) }
 
-type closeOpts struct{ clear bool }
+// Uninstall gives up ownership of every region and leaves them ownerless:
+// processes revert to their defaults now.
+func (r *Registry) Uninstall() error { return r.close(true) }
 
-// ReleaseLeases makes Close clear writer_id, so processes revert to their
-// defaults immediately (an uninstall). By default Close sets RELEASED and a
-// successor agent takes over without any reversion (SPEC §8.1).
-func ReleaseLeases(clear bool) CloseOption { return func(o *closeOpts) { o.clear = clear } }
-
-// Close releases ownership of every region and detaches them.
-func (r *Registry) Close(opts ...CloseOption) error {
-	var o closeOpts
-	for _, f := range opts {
-		f(&o)
-	}
+func (r *Registry) close(uninstall bool) error {
 	r.mu.Lock()
 	r.closed = true
 	cs := make([]*Client, 0, len(r.clients))
@@ -303,7 +266,7 @@ func (r *Registry) Close(opts ...CloseOption) error {
 	r.byPidfd = map[int]*Client{}
 	r.mu.Unlock()
 	for _, c := range cs {
-		c.release(o.clear)
+		c.release(uninstall)
 		c.Close()
 	}
 	return unix.Close(r.epfd)

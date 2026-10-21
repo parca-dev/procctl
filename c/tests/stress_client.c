@@ -1,4 +1,4 @@
-/* stress_client: hammers procctl_poll and procctl_grant_get, verifying every
+/* stress_client: hammers procctl_poll, verifying every
  * payload it receives against a self-checking pattern, while a second thread
  * publishes a self-checking consumer state as fast as it can. Exits on stdin
  * EOF and prints JSON stats; exit status 1 if anything torn got through. */
@@ -15,8 +15,7 @@
 
 #define PAYLOAD_CAP 16384
 #define STATE_CAP 1024
-#define SLOTS 4
-static _Alignas(8) unsigned char g_state[PROCCTL_STATE_STORAGE(SLOTS, STATE_CAP)];
+static _Alignas(8) unsigned char g_state[PROCCTL_STATE_SIZE(STATE_CAP)];
 static procctl_t g_ctx;
 static atomic_int g_stop;
 
@@ -49,7 +48,7 @@ static void *state_writer(void *arg) {
     uint64_t l64 = len;
     memcpy(buf + 8, &l64, 8);
     for (size_t i = 16; i < len; i++) buf[i] = pat(n, i);
-    procctl_state_set(&g_ctx, buf, len, 0);
+    procctl_state_set(&g_ctx, buf, len);
     if (n % 4) usleep((useconds_t)(n % 50)); /* bursts with short gaps */
   }
   return NULL;
@@ -66,7 +65,7 @@ static void *stdin_watch(void *arg) {
 
 int main(void) {
   procctl_config_t cfg = {.consumer = "stress", .schema_version = 1,
-                          .payload_capacity = PAYLOAD_CAP, .resource_slots = SLOTS,
+                          .payload_capacity = PAYLOAD_CAP,
                           .state_capacity = STATE_CAP, .state_storage = g_state};
   if (procctl_init(&g_ctx, &cfg)) return 2;
   pthread_t w, s;
@@ -76,10 +75,7 @@ int main(void) {
   fflush(stdout);
 
   static uint8_t buf[PAYLOAD_CAP];
-  uint64_t polls = 0, changes = 0, busy = 0, bad = 0, grant_reads = 0, grant_bad = 0;
-  uint64_t last_gen = 0, backwards = 0, grant_busy = 0;
-  int grant_other = 0;
-  uint8_t id[16];
+  uint64_t polls = 0, changes = 0, busy = 0, bad = 0, last_gen = 0, backwards = 0;
   while (!atomic_load(&g_stop)) {
     uint64_t gen = 0;
     int n = procctl_poll(&g_ctx, buf, sizeof buf, &gen);
@@ -89,31 +85,17 @@ int main(void) {
       if (gen <= last_gen) backwards++;
       last_gen = gen;
       if (!check_payload(buf, n)) bad++;
-      procctl_ack(&g_ctx, gen, PROCCTL_TRY);
+      procctl_ack(&g_ctx, gen);
     } else if (n == -EAGAIN) {
       busy++;
-    }
-    if ((polls & 63) == 0) {
-      /* Grants: the agent writes slot i with id = {i}, duration = 1000 + its generation tag. */
-      for (int i = 0; i < SLOTS; i++) {
-        memset(id, i + 1, sizeof id);
-        procctl_grant_t g;
-        int grc = procctl_grant_get(&g_ctx, 7, id, &g);
-        if (grc == -EAGAIN) grant_busy++; else if (grc != 0) grant_other = grc;
-        if (grc == 0) {
-          grant_reads++;
-          if (g.grant_id && g.duration_ns != 1000 + (uint64_t)(i + 1)) grant_bad++;
-        }
-      }
     }
   }
   atomic_store(&g_stop, 1);
   pthread_join(w, NULL);
   printf("{\"ev\":\"stats\",\"polls\":%llu,\"changes\":%llu,\"busy\":%llu,\"bad\":%llu,"
-         "\"backwards\":%llu,\"grant_reads\":%llu,\"grant_bad\":%llu,\"grant_busy\":%llu,\"grant_other\":%d}\n",
+         "\"backwards\":%llu}\n",
          (unsigned long long)polls, (unsigned long long)changes, (unsigned long long)busy,
-         (unsigned long long)bad, (unsigned long long)backwards, (unsigned long long)grant_reads,
-         (unsigned long long)grant_bad, (unsigned long long)grant_busy, grant_other);
+         (unsigned long long)bad, (unsigned long long)backwards);
   fflush(stdout);
-  return (bad || backwards || grant_bad) ? 1 : 0;
+  return (bad || backwards) ? 1 : 0;
 }

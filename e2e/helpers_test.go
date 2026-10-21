@@ -188,11 +188,7 @@ func newScenario(t *testing.T, id string) *scenario {
 
 // agentArgs: defaults, then the scenario's, then the consumer (last wins).
 func (e *scenario) agentArgs(args []string) []string {
-	a := []string{"--rate=10", "--rescan=2s", "--lease=3s", "--summary-interval=500ms"}
-	a = append(a, args...)
-	if os.Getenv("E2E_AGENT_DEBUG") != "" {
-		a = append(a, "--debug")
-	}
+	a := append([]string{"--rate=10", "--rescan=2s", "--lease=3s"}, args...)
 	return append(a, "--consumer="+e.consumer)
 }
 
@@ -296,13 +292,7 @@ type clientSummary struct {
 	StartTime    uint64  `json:"start_time"`
 	HostStart    uint64  `json:"host_start_time"`
 	Owned        bool    `json:"owned"`
-	Path         string  `json:"path"`
-	ReadPath     string  `json:"read_path"`
 	OwnChanges   int     `json:"own_changes"`
-	WakeP50us    float64 `json:"wake_p50_us"`
-	WakeP99us    float64 `json:"wake_p99_us"`
-	WakeSamples  int     `json:"wake_samples"`
-	WakeFails    int     `json:"wake_fails"`
 	Stale        bool    `json:"stale"`
 	AckedGen     uint64  `json:"acked_gen"`
 	LastTag      uint64  `json:"last_tag"`
@@ -314,44 +304,23 @@ type clientSummary struct {
 	LatP99us     float64 `json:"lat_p99_us"`
 	Samples      int     `json:"samples"`
 	LeaseExpired bool    `json:"lease_expired"`
-	Holding      bool    `json:"holding"`
-	Acquires     uint64  `json:"acquires"`
-	Releases     uint64  `json:"releases"`
 	WriteErrs    uint64  `json:"write_errs"`
 	ReadErrs     uint64  `json:"read_errs"`
 }
 
 type summary struct {
-	TS        time.Time      `json:"ts"`
-	Node      string         `json:"node"`
-	AgentPID  int            `json:"agent_pid"`
-	Kernel    string         `json:"kernel"`
-	UptimeS   float64        `json:"uptime_s"`
-	Attached  int            `json:"attached"`
-	Owned     int            `json:"owned"`
-	Detached  int            `json:"detached"`
-	Rejected  map[string]int `json:"rejected"`
-	RSSKB     int64          `json:"rss_kb"`
-	Mapped    int            `json:"mapped_regions"`
-	CPUS      float64        `json:"cpu_s"`
-	Discovery string         `json:"discovery"`
-	Scan      struct {
-		Procs int     `json:"procs"`
-		FDs   int     `json:"fds"`
-		MS    float64 `json:"ms"`
-		Count int     `json:"count"`
-	} `json:"scan"`
-	Hello *struct {
-		FilesInspected, FilesWithHello, Uprobes, UprobesActive, FilesCached, UprobeErrors, Firings, MappingEvents, LostEvents, InspectFailures uint64
-	} `json:"hello"`
-	Clients   []clientSummary `json:"clients"`
-	Resources []struct {
-		HolderPID int     `json:"holder_pid"`
-		Pending   int     `json:"pending"`
-		BlockedMS float64 `json:"blocked_ms"`
-		Grants    uint64  `json:"grants"`
-		Renewals  uint64  `json:"renewals"`
-	} `json:"resources"`
+	TS       time.Time       `json:"ts"`
+	Node     string          `json:"node"`
+	AgentPID int             `json:"agent_pid"`
+	Kernel   string          `json:"kernel"`
+	Attached int             `json:"attached"`
+	Owned    int             `json:"owned"`
+	Detached int             `json:"detached"`
+	Rejected map[string]int  `json:"rejected"`
+	RSSKB    int64           `json:"rss_kb"`
+	CPUS     float64         `json:"cpu_s"`
+	Mapped   int             `json:"mapped_regions"`
+	Clients  []clientSummary `json:"clients"`
 }
 
 // latest returns the newest summary of the scenario's agent.
@@ -481,12 +450,9 @@ type clientEvent struct {
 	PID          int     `json:"pid"`
 	TS           uint64  `json:"ts"`
 	Expired      *int    `json:"expired"`
-	Grant        uint64  `json:"grant"`
 	SinceStartMS float64 `json:"since_start_ms"`
 	Reinit       *int    `json:"reinit"`
 	InheritedAck int     `json:"inherited_ack"`
-	Mode         string  `json:"mode"`
-	Total        uint64  `json:"total"`
 }
 
 func parseEvents(out string) []clientEvent {
@@ -510,17 +476,6 @@ func (e *scenario) events(pod string) []clientEvent {
 	return parseEvents(out)
 }
 
-// allEvents also includes the previous container's log (a client killed and
-// restarted in place).
-func (e *scenario) allEvents(pod string) []clientEvent {
-	e.t.Helper()
-	var evs []clientEvent
-	if out, err := kubectlErr("-n", e.clientNS, "logs", pod, "--previous"); err == nil {
-		evs = parseEvents(out)
-	}
-	return append(evs, e.events(pod)...)
-}
-
 func (e *scenario) leaseEvents(pod string, expired bool) []clientEvent {
 	var out []clientEvent
 	for _, ev := range e.events(pod) {
@@ -529,53 +484,6 @@ func (e *scenario) leaseEvents(pod string, expired bool) []clientEvent {
 		}
 	}
 	return out
-}
-
-// ---- node access (kind only) ---------------------------------------------------------
-
-// nodeExec runs a command on the kind node, as root.
-func nodeExec(t *testing.T, node string, args ...string) string {
-	t.Helper()
-	if !onKind {
-		t.Skip("needs node access (kind)")
-	}
-	out, err := exec.Command("docker", append([]string{"exec", node}, args...)...).CombinedOutput()
-	if err != nil {
-		t.Fatalf("docker exec %s %v: %v\n%s", node, args, err, out)
-	}
-	return string(out)
-}
-
-// sameProcess reports whether pid on the node is still the process that
-// started at start (field 22 of /proc/<pid>/stat), not a reused pid.
-func sameProcess(node string, pid int, start uint64) bool {
-	out, err := exec.Command("docker", "exec", node, "cat", fmt.Sprintf("/proc/%d/stat", pid)).Output()
-	if err != nil {
-		return false
-	}
-	i := bytes.LastIndexByte(out, ')')
-	if i < 0 {
-		return false
-	}
-	f := strings.Fields(string(out[i+1:]))
-	return len(f) >= 20 && f[19] == strconv.FormatUint(start, 10)
-}
-
-// signal sends sig to a host pid on the kind node.
-func signal(t *testing.T, node string, sig string, pid int) {
-	t.Helper()
-	nodeExec(t, node, "kill", "-"+sig, strconv.Itoa(pid))
-}
-
-// signalClient signals the process the agent attached for pod, after checking
-// it is still that process (the pod may have restarted since the summary).
-func signalClient(t *testing.T, s summary, pod, sig string) {
-	t.Helper()
-	c, ok := byPod(s)[pod]
-	if !ok || !sameProcess(s.Node, c.HostPID, c.HostStart) {
-		t.Fatalf("%s: process %d from the summary is gone", pod, c.HostPID)
-	}
-	signal(t, s.Node, sig, c.HostPID)
 }
 
 func getenv(k, def string) string {

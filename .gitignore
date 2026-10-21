@@ -1,5 +1,6 @@
+artifacts/
 bin/
 .claude/
 __pycache__/
-spike/pcsampling/pcprobe
 spike/pcsampling/ctlthread
+spike/pcsampling/pcprobe

@@ -6,90 +6,38 @@
 package procctl
 
 type wireHeader struct {
-	Signature       [8]uint8
-	Spec_major      uint16
-	Spec_minor      uint16
-	Header_size     uint32
-	Total_size      uint64
-	Page_size       uint32
-	Flags           uint32
-	Consumer        [32]uint8
-	Schema_version  uint32
-	Creator_pid     uint32
-	Agent_area_off  uint64
-	Agent_area_size uint64
-	State_addr      uint64
-	State_size      uint32
-	Resource_slots  uint16
-	Reserved0       uint16
-	Created_at_ns   uint64
-	Instance_id     uint64
-	Header_crc32c   uint32
-	Reserved1       uint32
+	Magic          [8]uint8
+	Version        uint16
+	Header_size    uint16
+	Page_size      uint32
+	Total_size     uint64
+	Consumer       [32]uint8
+	Schema_version uint32
+	State_size     uint32
+	State_addr     uint64
+	Instance_id    uint64
 }
 type ctrlBlock struct {
-	Seq            uint64
-	Payload_len    uint32
-	Flags          uint32
-	Writer_id      uint64
-	Heartbeat_ns   uint64
-	Lease_ns       uint64
-	Writer_pid     uint32
-	Writer_flags   uint32
-	Writer_start   uint64
-	Payload_crc32c uint32
-	Reserved       uint32
+	Seq          uint64
+	Owner_id     uint64
+	Heartbeat_ns uint64
+	Lease_ns     uint64
+	Payload_len  uint32
+	Payload_crc  uint32
+	Flags        uint32
+	Reserved     uint32
 }
-type grantEntry struct {
-	Resource_id [16]uint8
-	Grant_id    uint64
-	Duration_ns uint64
-	Kind        uint32
-	Flags       uint32
-	Reserved    uint64
-}
-type stateHeader struct {
-	Magic             [8]uint8
-	Seq               uint64
-	Instance_id       uint64
-	Writer_pid        uint32
-	State_len         uint32
-	Applied_gen       uint64
-	Applied_writer_id uint64
-	Grants_seen_gen   uint64
-	Crc32c            uint32
-	Reserved          uint32
-}
-type resEntry struct {
-	Resource_id      [16]uint8
-	Grant_id         uint64
-	Last_activity_ns uint64
-	Kind             uint32
-	State            uint32
-	Flags            uint32
-	Error            uint32
+type stateBlock struct {
+	Magic       [8]uint8
+	Seq         uint64
+	Instance_id uint64
+	Applied_gen uint64
+	Pid         uint32
+	Len         uint32
 }
 
 const (
-	SpecMajor = 0x1
-	SpecMinor = 0x0
-)
-
-const (
-	MaxSlots     = 0x40
+	Version      = 0x1
 	MaxStateSize = 0x10000
-)
-
-const (
-	FlagPayloadValid = 0x1
-	writerReleased   = 0x1
-)
-
-const (
-	ResIdle      = 0x0
-	ResAcquiring = 0x1
-	ResHolding   = 0x2
-	ResReleased  = 0x3
-	ResFailed    = 0x4
-	ResFlagWant  = 0x1
+	flagReleased = 0x1
 )

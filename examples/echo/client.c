@@ -20,7 +20,7 @@
 #include <unistd.h>
 
 #define STATE_CAP 256
-static _Alignas(8) unsigned char g_state[PROCCTL_STATE_STORAGE(0, STATE_CAP)];
+static _Alignas(8) unsigned char g_state[PROCCTL_STATE_SIZE(STATE_CAP)];
 static procctl_t g_ctx;
 
 static void say(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -48,7 +48,7 @@ static void run(long interval_ms, long exit_after_ms, long fork_after_ms, int re
       forked = 1;
       pid_t pid = fork();
       if (pid == 0) {
-        int r = procctl_ack(&g_ctx, 1, 0);
+        int r = procctl_ack(&g_ctx, 1);
         say("forked child: state writes refused (%s)", r == -ECHILD ? "-ECHILD" : "unexpected");
         if (reinit) {
           r = procctl_reinit(&g_ctx);
@@ -74,11 +74,11 @@ static void run(long interval_ms, long exit_after_ms, long fork_after_ms, int re
       say("config gen=%llu: %s", (unsigned long long)gen, buf);
       char st[STATE_CAP];
       int len = snprintf(st, sizeof st, "applied gen=%llu bytes=%d", (unsigned long long)gen, n);
-      procctl_state_set(&g_ctx, st, (size_t)len, 0);
-      procctl_ack(&g_ctx, gen, 0);
+      procctl_state_set(&g_ctx, st, (size_t)len);
+      procctl_ack(&g_ctx, gen);
     } else if (n == -ENODATA) {
       say("config gen=%llu: none (agent cleared config): using defaults", (unsigned long long)gen);
-      procctl_ack(&g_ctx, gen, 0);
+      procctl_ack(&g_ctx, gen);
     } else if (n < 0 && n != -EAGAIN) {
       say("poll error %d", n);
     }
@@ -100,7 +100,7 @@ int main(int argc, char **argv) {
     }
   }
   procctl_config_t cfg = {.consumer = "echo", .schema_version = 1, .payload_capacity = 4096,
-                          .resource_slots = 0, .state_capacity = STATE_CAP,
+                          .state_capacity = STATE_CAP,
                           .state_storage = g_state};
   int r = procctl_init(&g_ctx, &cfg);
   if (r) {

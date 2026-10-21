@@ -20,78 +20,48 @@ import (
 // Key identifies a region independently of which process holds it.
 type Key struct{ Dev, Ino uint64 }
 
-// Identity is one agent instance's owner identity (SPEC §8.1).
-type Identity struct {
-	WriterID uint64 // random, non-zero
-	PID      uint32 // this agent's pid in its own pid namespace
-	Start    uint64 // field 22 of /proc/self/stat
-}
-
-// NewIdentity creates a fresh identity for this agent process.
-func NewIdentity() (Identity, error) {
+// NewOwnerID returns a random, non-zero owner id for one agent instance.
+func NewOwnerID() uint64 {
 	var b [8]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return Identity{}, err
-	}
-	id := binary.LittleEndian.Uint64(b[:]) | 1
-	st, err := startTime("/proc", os.Getpid())
-	if err != nil {
-		return Identity{}, err
-	}
-	return Identity{WriterID: id, PID: uint32(os.Getpid()), Start: st}, nil
+	_, _ = rand.Read(b[:])
+	return binary.LittleEndian.Uint64(b[:]) | 1
 }
 
 // AttachOptions configures Attach.
 type AttachOptions struct {
-	ProcRoot          string // default "/proc"
-	MaxRegionSize     int64  // default 4 MiB
-	ForceProcFallback bool   // skip pidfd_getfd; open /proc/<pid>/fd/<n>
-	// ForceMemFallback reads state blocks with pread on /proc/<pid>/mem
-	// instead of process_vm_readv. Attach also falls back by itself when
-	// process_vm_readv is refused (ENOSYS, EPERM: e.g. seccomp).
-	ForceMemFallback bool
-	Identity         Identity      // required
-	Lease            time.Duration // lease_ns written on claim; 0 = no lease
-	ReadTimeout      time.Duration // remote state reads; default 1s
+	OwnerID       uint64        // required: this agent instance (NewOwnerID)
+	Lease         time.Duration // written on claim; processes revert after this long without a heartbeat
+	ProcRoot      string        // default "/proc"
+	MaxRegionSize int64         // default 4 MiB
+	ReadTimeout   time.Duration // remote state reads; default 1s
 }
 
 // Info describes an attached region.
 type Info struct {
-	Key           Key
-	HostPID       int
-	NSPid         []int
-	Header        Header
-	AttachPath    string // "pidfd_getfd" or "proc"
-	ReadPath      string // "process_vm_readv" or "proc_mem"
-	PayloadCap    int
-	ResourceSlots int
+	Key     Key
+	HostPID int   // in the agent's pid namespace
+	NSPid   []int // the process's pid in each namespace, outermost first
+	Header  Header
 }
 
-// Client is an attached region. Methods are safe for concurrent use.
+// Client is one attached region. Methods are safe for concurrent use.
 type Client struct {
-	mu       sync.Mutex
-	info     Info
-	area     area
-	pidfd    int
-	rd       remoteReader
-	opt      AttachOptions
-	owned    bool
-	closed   bool
-	done     chan struct{}
-	doneOnce sync.Once
+	mu     sync.Mutex
+	info   Info
+	mem    []byte
+	area   area
+	pidfd  int
+	opt    AttachOptions
+	owned  bool
+	closed bool
+	done   chan struct{}
+	once   sync.Once
 
-	// Claim rule 4 bookkeeping: heartbeat value and when we first saw it.
-	hbSeen   uint64
+	hbSeen   uint64 // the owner's heartbeat last seen...
 	hbSeenAt time.Time
 
-	// Last publication, for republish on CRC drift (SPEC §7.4).
-	pubValid   bool
-	pubGen     uint64
-	pubPayload []byte
-	pubGrants  []Grant
-	pubFlags   uint32
-	pubCRC     uint32
-	pubLen     uint32
+	pub    []byte // our last payload, republished if another writer clobbered it
+	pubGen uint64
 }
 
 var (
@@ -101,8 +71,12 @@ var (
 	ErrClosed = errors.New("procctl: client closed")
 )
 
-// Attach validates and maps the region behind fd in process pid (SPEC §10.2).
+// Attach validates and maps the region behind fd in process pid. The region
+// comes from an untrusted process: every check here is a reason to refuse it.
 func Attach(pid, fd int, opt AttachOptions) (*Client, error) {
+	if opt.OwnerID == 0 {
+		return nil, errors.New("procctl: AttachOptions.OwnerID is required")
+	}
 	if opt.ProcRoot == "" {
 		opt.ProcRoot = "/proc"
 	}
@@ -112,23 +86,21 @@ func Attach(pid, fd int, opt AttachOptions) (*Client, error) {
 	if opt.ReadTimeout == 0 {
 		opt.ReadTimeout = time.Second
 	}
-	if opt.Identity.WriterID == 0 {
-		return nil, errors.New("procctl: AttachOptions.Identity is required")
-	}
-	fdPath := fmt.Sprintf("%s/%d/fd/%d", opt.ProcRoot, pid, fd)
-	link, err := os.Readlink(fdPath)
+	path := fmt.Sprintf("%s/%d/fd/%d", opt.ProcRoot, pid, fd)
+	link, err := os.Readlink(path)
 	if err != nil {
 		return nil, err
 	}
-	consumer, major, ok := parseMemfdName(link)
+	consumer, version, ok := parseMemfdName(link)
 	if !ok {
 		return nil, invalid("not a procctl memfd: %q", link)
 	}
-	if major != SpecMajor {
-		return nil, invalid("spec major %d in name", major)
+	if version != Version {
+		return nil, invalid("version %d in name", version)
 	}
 
-	// 1. Pin the process.
+	// The pidfd pins the process: reads go to it and nothing else, and it
+	// tells the registry when the process exits.
 	pidfd, err := unix.PidfdOpen(pid, 0)
 	if err != nil {
 		return nil, fmt.Errorf("pidfd_open: %w", err)
@@ -139,324 +111,190 @@ func Attach(pid, fd int, opt AttachOptions) (*Client, error) {
 			unix.Close(pidfd)
 		}
 	}()
-
-	// 2. Obtain the fd.
-	path := "proc"
-	var rfd int
-	if !opt.ForceProcFallback {
-		rfd, err = unix.PidfdGetfd(pidfd, fd, 0)
-		if err == nil {
-			path = "pidfd_getfd"
-		}
-	}
-	if path == "proc" {
-		rfd, err = unix.Open(fdPath, unix.O_RDWR|unix.O_CLOEXEC, 0)
-		if err != nil {
-			return nil, fmt.Errorf("open %s: %w", fdPath, err)
-		}
+	rfd, err := unix.Open(path, unix.O_RDWR|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, fmt.Errorf("open %s: %w", path, err)
 	}
 	defer unix.Close(rfd)
 	if err := unix.PidfdSendSignal(pidfd, 0, nil, 0); err != nil {
-		return nil, ErrExited
+		return nil, ErrExited // pid reused between readlink and pidfd_open
 	}
 
-	// 3. File checks.
 	var st unix.Stat_t
+	var sfs unix.Statfs_t
 	if err := unix.Fstat(rfd, &st); err != nil {
 		return nil, err
 	}
-	if st.Mode&unix.S_IFMT != unix.S_IFREG {
-		return nil, invalid("not a regular file")
-	}
-	if st.Size <= 0 || st.Size > opt.MaxRegionSize {
-		return nil, invalid("size %d outside (0, %d]", st.Size, opt.MaxRegionSize)
-	}
-	var sfs unix.Statfs_t
 	if err := unix.Fstatfs(rfd, &sfs); err != nil {
 		return nil, err
 	}
-	if sfs.Type != unix.TMPFS_MAGIC {
-		return nil, invalid("not on tmpfs (fs magic %#x)", sfs.Type)
+	switch {
+	case st.Mode&unix.S_IFMT != unix.S_IFREG || sfs.Type != unix.TMPFS_MAGIC:
+		return nil, invalid("not a memfd")
+	case st.Size <= 0 || st.Size > opt.MaxRegionSize:
+		return nil, invalid("size %d", st.Size)
 	}
-
-	// 4. Seals.
+	// The seals keep the size fixed (no SIGBUS) and the header final.
 	seals, err := unix.FcntlInt(uintptr(rfd), unix.F_GET_SEALS, 0)
 	if err != nil {
 		return nil, fmt.Errorf("F_GET_SEALS: %w", err)
 	}
 	need := unix.F_SEAL_SHRINK | unix.F_SEAL_GROW | unix.F_SEAL_SEAL
-	if seals&need != need {
-		return nil, invalid("missing seals (have %#x)", seals)
-	}
-	if seals&(unix.F_SEAL_WRITE|unix.F_SEAL_FUTURE_WRITE) != 0 {
-		return nil, invalid("write-sealed")
+	if seals&need != need || seals&(unix.F_SEAL_WRITE|unix.F_SEAL_FUTURE_WRITE) != 0 {
+		return nil, invalid("seals %#x", seals)
 	}
 
-	// 5–7. Map, snapshot and validate the header.
 	mem, err := unix.Mmap(rfd, 0, int(st.Size), unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED)
 	if err != nil {
 		return nil, fmt.Errorf("mmap: %w", err)
 	}
-	snap := append([]byte(nil), mem[:HeaderSize]...)
-	h, err := ParseHeader(snap, uint64(st.Size))
+	h, err := ParseHeader(append([]byte(nil), mem[:HeaderSize]...), uint64(st.Size))
 	if err == nil && h.Consumer != consumer {
-		err = invalid("consumer %q does not match name %q", h.Consumer, consumer)
+		err = invalid("consumer %q, name says %q", h.Consumer, consumer)
+	}
+	var ns []int
+	if err == nil {
+		ns, err = nsPIDs(opt.ProcRoot, pid)
 	}
 	if err != nil {
 		unix.Munmap(mem)
 		return nil, err
 	}
-	_ = unix.Mprotect(mem[:h.PageSize], unix.PROT_READ)
-
-	ns, err := nsPIDs(opt.ProcRoot, pid)
-	if err != nil {
-		unix.Munmap(mem)
-		return nil, err
-	}
-	rd, readPath, err := openReader(opt, pid, h.StateAddr)
-	if err != nil {
-		unix.Munmap(mem)
-		return nil, err
-	}
-	c := &Client{
-		info: Info{
-			Key:           Key{Dev: uint64(st.Dev), Ino: st.Ino},
-			HostPID:       pid,
-			NSPid:         ns,
-			Header:        h,
-			AttachPath:    path,
-			ReadPath:      readPath,
-			PayloadCap:    h.PayloadCapacity(),
-			ResourceSlots: int(h.ResourceSlots),
-		},
-		area:  area{mem: mem, body: mem[h.AreaOff:], slots: int(h.ResourceSlots)},
+	_ = unix.Mprotect(mem[:h.PageSize], unix.PROT_READ) // we only ever read the header copy
+	ok = true
+	return &Client{
+		info:  Info{Key: Key{Dev: uint64(st.Dev), Ino: st.Ino}, HostPID: pid, NSPid: ns, Header: h},
+		mem:   mem,
+		area:  area{body: mem[h.PageSize:]},
 		pidfd: pidfd,
-		rd:    rd,
 		opt:   opt,
 		done:  make(chan struct{}),
-	}
-	ok = true
-	return c, nil
+	}, nil
 }
 
-// openReader picks how the state block is read: process_vm_readv, unless it
-// is forced off or refused, then /proc/<pid>/mem.
-func openReader(opt AttachOptions, pid int, stateAddr uint64) (remoteReader, string, error) {
-	if !opt.ForceMemFallback {
-		var b [8]byte
-		err := vmReader{pid}.read(stateAddr, b[:])
-		if !errors.Is(err, unix.ENOSYS) && !errors.Is(err, unix.EPERM) {
-			return vmReader{pid}, "process_vm_readv", nil // other errors are the process's problem
-		}
-	}
-	f, err := os.Open(fmt.Sprintf("%s/%d/mem", opt.ProcRoot, pid))
-	if err != nil {
-		return nil, "", fmt.Errorf("open /proc/<pid>/mem: %w", err)
-	}
-	return memReader{f}, "proc_mem", nil
-}
-
-// parseMemfdName parses "/memfd:procctl:<consumer>-v<major>[ (deleted)]".
-func parseMemfdName(link string) (consumer string, major int, ok bool) {
-	if !strings.HasPrefix(link, memfdPrefix) {
+// parseMemfdName parses "/memfd:procctl:<consumer>-v<version>[ (deleted)]".
+func parseMemfdName(link string) (consumer string, version int, ok bool) {
+	s, found := strings.CutPrefix(link, memfdPrefix)
+	if !found {
 		return "", 0, false
 	}
-	s := strings.TrimSuffix(link[len(memfdPrefix):], " (deleted)")
+	s = strings.TrimSuffix(s, " (deleted)")
 	i := strings.LastIndex(s, "-v")
 	if i <= 0 {
 		return "", 0, false
 	}
-	m, err := strconv.Atoi(s[i+2:])
-	if err != nil {
-		return "", 0, false
-	}
-	return s[:i], m, true
+	v, err := strconv.Atoi(s[i+2:])
+	return s[:i], v, err == nil
 }
 
-// Info returns the region's identity and layout.
+// Info returns the region's identity and header.
 func (c *Client) Info() Info { return c.info }
 
 // Done is closed when the process exits or the client is closed.
 func (c *Client) Done() <-chan struct{} { return c.done }
 
-func (c *Client) markDone() { c.doneOnce.Do(func() { close(c.done) }) }
+func (c *Client) markDone() { c.once.Do(func() { close(c.done) }) }
 
-// Owned reports whether this agent currently owns the region.
+// Owned reports whether this agent owns the region.
 func (c *Client) Owned() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.owned && ld64(&c.area.cb().Writer_id) == c.opt.Identity.WriterID
+	return c.owned && ld64(&c.area.cb().Owner_id) == c.opt.OwnerID
 }
 
-// claimLocked tries to become the owner (SPEC §8.1).
+// claimLocked becomes the owner if the region has none, its owner released
+// it, or the owner's heartbeat has not changed for a lease.
 func (c *Client) claimLocked(now time.Time) bool {
 	if c.closed {
 		return false
 	}
-	id := c.opt.Identity
-	w := ld64(&c.area.cb().Writer_id)
-	if w == id.WriterID {
+	cb := c.area.cb()
+	owner := ld64(&cb.Owner_id)
+	if owner == c.opt.OwnerID {
 		c.owned = true
 		return true
 	}
-	hb := ld64(&c.area.cb().Heartbeat_ns)
-	if hb != c.hbSeen || c.hbSeenAt.IsZero() {
+	if hb := ld64(&cb.Heartbeat_ns); hb != c.hbSeen || c.hbSeenAt.IsZero() {
 		c.hbSeen, c.hbSeenAt = hb, now
 	}
-	may := w == 0 ||
-		ld32(&c.area.cb().Writer_flags)&writerReleased != 0 ||
-		c.ownerGone() ||
-		(ld64(&c.area.cb().Lease_ns) != 0 &&
-			now.Sub(c.hbSeenAt) > time.Duration(ld64(&c.area.cb().Lease_ns)))
-	if !may || !cas64(&c.area.cb().Writer_id, w, id.WriterID) {
+	lease := time.Duration(ld64(&cb.Lease_ns))
+	free := owner == 0 || ld32(&cb.Flags)&flagReleased != 0 || (lease > 0 && now.Sub(c.hbSeenAt) > lease)
+	if !free || !cas64(&cb.Owner_id, owner, c.opt.OwnerID) {
 		c.owned = false
 		return false
 	}
-	st32(&c.area.cb().Writer_pid, id.PID)
-	st64(&c.area.cb().Writer_start, id.Start)
-	st32(&c.area.cb().Writer_flags, 0)
-	st64(&c.area.cb().Lease_ns, uint64(c.opt.Lease))
+	st32(&cb.Flags, 0)
+	st64(&cb.Lease_ns, uint64(c.opt.Lease))
 	c.heartbeatLocked()
 	c.owned = true
-	c.adoptLocked()
+	// Keep the current configuration: it is ours to republish from now on.
+	if gen, payload, err := c.area.read(); err == nil && gen != 0 {
+		c.pub, c.pubGen = payload, gen
+	}
 	return true
 }
 
-// adoptLocked takes the region's current payload and grant table as this
-// owner's publication, so later writes keep them (SPEC §9.2 A4) and drift
-// checks compare against them.
-func (c *Client) adoptLocked() {
-	gen, payload, grants, err := c.area.readPayload()
-	if err != nil || gen == 0 {
-		return
-	}
-	c.pubValid = true
-	c.pubGen = gen
-	c.pubFlags = ld32(&c.area.cb().Flags)
-	c.pubPayload = append([]byte(nil), payload...)
-	c.pubGrants = grants
-	c.pubLen = ld32(&c.area.cb().Payload_len)
-	c.pubCRC = ld32(&c.area.cb().Payload_crc32c)
-}
-
-// ownerGone: claim rule 3. Only meaningful when agents share a pid namespace.
-func (c *Client) ownerGone() bool {
-	pid := ld32(&c.area.cb().Writer_pid)
-	want := ld64(&c.area.cb().Writer_start)
-	if pid == 0 {
-		return false
-	}
-	got, err := startTime(c.opt.ProcRoot, int(pid))
-	if err != nil {
-		return errors.Is(err, os.ErrNotExist)
-	}
-	return got != want
-}
-
 func (c *Client) heartbeatLocked() {
+	cb := c.area.cb()
 	now := uint64(bootNow())
-	prev := ld64(&c.area.cb().Heartbeat_ns)
-	if now <= prev {
-		now = prev + 1
+	if prev := ld64(&cb.Heartbeat_ns); now <= prev {
+		now = prev + 1 // strictly increasing, whatever the clocks
 	}
-	st64(&c.area.cb().Heartbeat_ns, now)
+	st64(&cb.Heartbeat_ns, now)
 }
 
-// Write publishes a consumer payload and grant table as one generation.
-// payload == nil publishes "no consumer configuration" (PAYLOAD_VALID clear).
-// Grants with GrantID 0 are new and receive the returned generation.
-func (c *Client) Write(payload []byte, grants []Grant) (uint64, []Grant, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.writeLocked(payload, payload != nil, grants)
-}
-
-// WritePayload publishes a new consumer payload and keeps the current grants.
-func (c *Client) WritePayload(payload []byte) (uint64, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	gen, _, err := c.writeLocked(payload, payload != nil, c.pubGrants)
-	return gen, err
-}
-
-// WriteGrants publishes a new grant table and keeps the current payload.
-// Grants with GrantID 0 are new and receive the returned generation.
-func (c *Client) WriteGrants(grants []Grant) (uint64, []Grant, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.writeLocked(c.pubPayload, c.pubFlags&FlagPayloadValid != 0, grants)
-}
-
-// Grants returns the grant table this agent last published (or adopted),
-// and that publication's generation.
-func (c *Client) Grants() ([]Grant, uint64) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return append([]Grant(nil), c.pubGrants...), c.pubGen
-}
-
-func (c *Client) writeLocked(payload []byte, valid bool, grants []Grant) (uint64, []Grant, error) {
-	if c.closed {
-		return 0, nil, ErrClosed
-	}
-	if !c.owned && !c.claimLocked(time.Now()) {
-		return 0, nil, ErrNotOwner
-	}
-	if ld64(&c.area.cb().Writer_id) != c.opt.Identity.WriterID {
-		c.owned = false
-		return 0, nil, ErrPreempted
-	}
-	var flags uint32
-	if valid {
-		flags = FlagPayloadValid
-	}
-	gen, out, err := c.area.write(payload, grants, flags)
-	if err != nil {
-		if errors.Is(err, ErrPreempted) {
-			c.owned = false
-		}
-		return 0, nil, err
-	}
-	c.pubValid = true
-	c.pubGen = gen
-	c.pubPayload = append([]byte(nil), payload...)
-	c.pubGrants = out
-	c.pubFlags = flags
-	c.pubLen = ld32(&c.area.cb().Payload_len)
-	c.pubCRC = ld32(&c.area.cb().Payload_crc32c)
-	return gen, out, nil
-}
-
-// Heartbeat claims the region if allowed, refreshes heartbeat_ns, and
-// republishes if the agent payload drifted from the last publication (§7.4).
-func (c *Client) Heartbeat() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+// ownLocked claims the region if it can, and checks nobody took it over.
+func (c *Client) ownLocked() error {
 	if c.closed {
 		return ErrClosed
 	}
-	if !c.owned {
-		if !c.claimLocked(time.Now()) {
-			return ErrNotOwner
-		}
-		return nil
+	if !c.owned && !c.claimLocked(time.Now()) {
+		return ErrNotOwner
 	}
-	if ld64(&c.area.cb().Writer_id) != c.opt.Identity.WriterID {
+	if ld64(&c.area.cb().Owner_id) != c.opt.OwnerID {
 		c.owned = false
 		return ErrPreempted
 	}
+	return nil
+}
+
+// Write publishes payload as a new configuration generation and returns it.
+// An empty payload tells the process to use its defaults.
+func (c *Client) Write(payload []byte) (uint64, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.ownLocked(); err != nil {
+		return 0, err
+	}
+	gen, err := c.area.write(payload)
+	if err != nil {
+		return 0, err
+	}
+	c.pub, c.pubGen = append([]byte(nil), payload...), gen
+	return gen, nil
+}
+
+// Heartbeat keeps the lease alive (call it every Lease/4 or so), claiming the
+// region first if this agent may. If another writer clobbered our last
+// payload (an old owner that resumed mid-write), it is published again.
+func (c *Client) Heartbeat() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.ownLocked(); err != nil {
+		return err
+	}
 	c.heartbeatLocked()
-	if c.pubValid && (ld32(&c.area.cb().Payload_len) != c.pubLen || ld32(&c.area.cb().Payload_crc32c) != c.pubCRC) {
-		if gen, _, err := c.area.write(c.pubPayload, c.pubGrants, c.pubFlags); err == nil {
-			c.pubGen = gen
-			c.pubLen = ld32(&c.area.cb().Payload_len)
-			c.pubCRC = ld32(&c.area.cb().Payload_crc32c)
+	if c.pubGen != 0 {
+		if gen, payload, err := c.area.read(); err != nil || gen != c.pubGen || string(payload) != string(c.pub) {
+			if gen, err := c.area.write(c.pub); err == nil {
+				c.pubGen = gen
+			}
 		}
 	}
 	return nil
 }
 
-// ReadState reads the process's state block (SPEC §7.3).
+// ReadState reads the process's state block.
 func (c *Client) ReadState(ctx context.Context) (State, error) {
 	select {
 	case <-c.done:
@@ -464,10 +302,10 @@ func (c *Client) ReadState(ctx context.Context) (State, error) {
 	default:
 	}
 	ns := c.info.NSPid
-	return readState(ctx, c.rd, &c.info.Header, ns[len(ns)-1], c.opt.ReadTimeout)
+	return readState(ctx, c.info.HostPID, &c.info.Header, ns[len(ns)-1], c.opt.ReadTimeout)
 }
 
-// WaitAck waits until the process acknowledges generation gen (SPEC §8.2).
+// WaitAck waits until the process has applied generation gen.
 func (c *Client) WaitAck(ctx context.Context, gen uint64) error {
 	t := time.NewTicker(5 * time.Millisecond)
 	defer t.Stop()
@@ -476,8 +314,7 @@ func (c *Client) WaitAck(ctx context.Context, gen uint64) error {
 		if errors.Is(err, ErrExited) {
 			return err
 		}
-		if err == nil && !st.Stale && st.AppliedGen >= gen &&
-			st.AppliedWriterID == c.opt.Identity.WriterID {
+		if err == nil && !st.Stale && st.AppliedGen >= gen {
 			return nil
 		}
 		select {
@@ -490,24 +327,25 @@ func (c *Client) WaitAck(ctx context.Context, gen uint64) error {
 	}
 }
 
-// release gives up ownership: RELEASED (successor may claim at once) or, if
-// clear is set, writer_id = 0 (the process reverts to defaults now).
-func (c *Client) release(clear bool) {
+// release gives up ownership: RELEASED (a successor takes over at once, the
+// process keeps its configuration) or, with uninstall, no owner (the process
+// reverts to its defaults now).
+func (c *Client) release(uninstall bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if !c.owned || c.closed {
 		return
 	}
-	if clear {
-		cas64(&c.area.cb().Writer_id, c.opt.Identity.WriterID, 0)
-	} else if ld64(&c.area.cb().Writer_id) == c.opt.Identity.WriterID {
-		st32(&c.area.cb().Writer_flags, writerReleased)
+	cb := c.area.cb()
+	if uninstall {
+		cas64(&cb.Owner_id, c.opt.OwnerID, 0)
+	} else if ld64(&cb.Owner_id) == c.opt.OwnerID {
+		st32(&cb.Flags, flagReleased)
 	}
 	c.owned = false
 }
 
-// Close unmaps the region and releases the pidfd. It does not release
-// ownership; see Registry.Close.
+// Close unmaps the region. It does not give up ownership; Registry.Close does.
 func (c *Client) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -516,10 +354,7 @@ func (c *Client) Close() error {
 	}
 	c.closed = true
 	c.markDone()
-	unix.Munmap(c.area.mem)
-	if m, ok := c.rd.(memReader); ok {
-		m.f.Close()
-	}
+	unix.Munmap(c.mem)
 	return unix.Close(c.pidfd)
 }
 

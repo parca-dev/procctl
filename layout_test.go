@@ -5,14 +5,12 @@ package procctl
 import (
 	"errors"
 	"testing"
-	"unsafe"
 )
 
 func validHeader() Header {
 	return Header{
-		SpecMajor: 1, TotalSize: 8192, PageSize: 4096, Consumer: "echo", SchemaVersion: 3,
-		CreatorPID: 7, AreaOff: 4096, AreaSize: 4096, StateAddr: 0x1000, StateSize: 64 + 2*48 + 64,
-		ResourceSlots: 2, CreatedAtNS: 1, InstanceID: 99,
+		Version: Version, PageSize: 4096, TotalSize: 8192, Consumer: "echo", SchemaVersion: 3,
+		StateAddr: 0x1000, StateSize: 128, InstanceID: 99,
 	}
 }
 
@@ -25,28 +23,25 @@ func TestParseHeaderRoundTrip(t *testing.T) {
 	if got != h {
 		t.Fatalf("round trip mismatch:\n got %+v\nwant %+v", got, h)
 	}
-	if got.PayloadCapacity() != 4096-64-2*48 {
+	if got.PayloadCapacity() != 4096-CtrlSize {
 		t.Fatalf("payload capacity %d", got.PayloadCapacity())
 	}
 }
 
 func TestParseHeaderRejects(t *testing.T) {
 	cases := map[string]func(h *Header, b []byte) []byte{
-		"bad signature":      func(h *Header, b []byte) []byte { b[0] = 'X'; return b },
-		"bad crc":            func(h *Header, b []byte) []byte { b[unsafe.Offsetof(wireHeader{}.Schema_version)] ^= 1; return b },
-		"major":              func(h *Header, b []byte) []byte { h.SpecMajor = 2; return nil },
-		"size mismatch":      func(h *Header, b []byte) []byte { h.TotalSize = 4096 * 3; return nil },
-		"page size":          func(h *Header, b []byte) []byte { h.PageSize = 1000; return nil },
-		"area offset":        func(h *Header, b []byte) []byte { h.AreaOff = 0; return nil },
-		"too many slots":     func(h *Header, b []byte) []byte { h.ResourceSlots = 65; return nil },
-		"resources overflow": func(h *Header, b []byte) []byte { h.ResourceSlots = 4; h.StateSize = 64 + 3*48; return nil },
-		"state unaligned":    func(h *Header, b []byte) []byte { h.StateAddr = 0x1001; return nil },
-		"state too small":    func(h *Header, b []byte) []byte { h.StateSize = 64; return nil },
-		"state too large":    func(h *Header, b []byte) []byte { h.StateSize = 70000; return nil },
-		"no state block":     func(h *Header, b []byte) []byte { h.StateAddr = 0; return nil },
-		"consumer chars":     func(h *Header, b []byte) []byte { h.Consumer = "Echo"; return nil },
-		"empty consumer":     func(h *Header, b []byte) []byte { h.Consumer = ""; return nil },
-		"zero instance":      func(h *Header, b []byte) []byte { h.InstanceID = 0; return nil },
+		"magic":           func(h *Header, b []byte) []byte { b[0] = 'X'; return b },
+		"version":         func(h *Header, b []byte) []byte { h.Version = 2; return nil },
+		"size mismatch":   func(h *Header, b []byte) []byte { h.TotalSize = 4096 * 3; return nil },
+		"page size":       func(h *Header, b []byte) []byte { h.PageSize = 1000; return nil },
+		"too small":       func(h *Header, b []byte) []byte { h.TotalSize = 4096; return nil },
+		"state unaligned": func(h *Header, b []byte) []byte { h.StateAddr = 0x1001; return nil },
+		"no state block":  func(h *Header, b []byte) []byte { h.StateAddr = 0; return nil },
+		"state too small": func(h *Header, b []byte) []byte { h.StateSize = 32; return nil },
+		"state too large": func(h *Header, b []byte) []byte { h.StateSize = 70000; return nil },
+		"consumer chars":  func(h *Header, b []byte) []byte { h.Consumer = "Echo"; return nil },
+		"empty consumer":  func(h *Header, b []byte) []byte { h.Consumer = ""; return nil },
+		"zero instance":   func(h *Header, b []byte) []byte { h.InstanceID = 0; return nil },
 	}
 	for name, mutate := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -55,7 +50,11 @@ func TestParseHeaderRejects(t *testing.T) {
 			if nb := mutate(&h, b); nb == nil {
 				b = encodeHeader(h)
 			}
-			if _, err := ParseHeader(b, 8192); !errors.Is(err, ErrInvalid) {
+			size := uint64(8192)
+			if name == "too small" {
+				size = 4096
+			}
+			if _, err := ParseHeader(b, size); !errors.Is(err, ErrInvalid) {
 				t.Fatalf("want ErrInvalid, got %v", err)
 			}
 		})
@@ -63,20 +62,19 @@ func TestParseHeaderRejects(t *testing.T) {
 }
 
 func TestParseMemfdName(t *testing.T) {
-	for link, want := range map[string]struct {
-		c  string
-		m  int
-		ok bool
-	}{
-		"/memfd:procctl:echo-v1 (deleted)": {"echo", 1, true},
-		"/memfd:procctl:parca_gpu-v12":     {"parca_gpu", 12, true},
-		"/memfd:procctl:echo":              {"", 0, false},
-		"/memfd:OTEL_CTX (deleted)":        {"", 0, false},
-		"/memfd:procctl:-v1":               {"", 0, false},
+	for link, want := range map[string]string{
+		"/memfd:procctl:echo-v1":             "echo/1",
+		"/memfd:procctl:gpu_v2-v1 (deleted)": "gpu_v2/1",
+		"/memfd:other":                       "",
+		"/memfd:procctl:echo":                "",
 	} {
-		c, m, ok := parseMemfdName(link)
-		if c != want.c || m != want.m || ok != want.ok {
-			t.Errorf("%q: got (%q,%d,%v) want %+v", link, c, m, ok, want)
+		c, v, ok := parseMemfdName(link)
+		got := ""
+		if ok {
+			got = c + "/" + string(rune('0'+v))
+		}
+		if got != want {
+			t.Errorf("%q: got %q, want %q", link, got, want)
 		}
 	}
 }

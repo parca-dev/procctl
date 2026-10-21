@@ -43,7 +43,7 @@ func main() {
 		n++
 		msg := fmt.Sprintf("hello #%d from agent pid %d at %s", n, os.Getpid(), time.Now().Format("15:04:05.000"))
 		t0 := time.Now()
-		gen, _, err := c.Write([]byte(msg), nil)
+		gen, err := c.Write([]byte(msg))
 		if err != nil {
 			log.Warn("write", "pid", c.Info().HostPID, "err", err)
 			return
@@ -68,11 +68,11 @@ func main() {
 	for {
 		select {
 		case <-ctx.Done():
-			var opts []procctl.CloseOption
 			if *uninstall {
-				opts = append(opts, procctl.ReleaseLeases(true))
+				_ = reg.Uninstall()
+			} else {
+				_ = reg.Close()
 			}
-			_ = reg.Close(opts...)
 			log.Info("closed", "uninstall", *uninstall)
 			return
 		case ev := <-reg.Events():

@@ -1,4 +1,4 @@
-/* poll() microbenchmarks (plan §8 item 6).
+/* poll() microbenchmarks.
  *   1. fast path: no change — target < 2 ns
  *   2. slow path: a new generation of 64 B and 4 KiB
  *   3. proxy for a ~5 µs CUDA launch: a 5 µs busy loop with and without a
@@ -14,7 +14,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-static _Alignas(8) uint8_t g_state[PROCCTL_STATE_STORAGE(0, 64)];
+static _Alignas(8) uint8_t g_state[PROCCTL_STATE_SIZE(64)];
 static procctl_t g_ctx;
 static uint8_t *g_area; /* writable view, playing the agent */
 
@@ -24,9 +24,8 @@ static void agent_write(const void *p, uint32_t n) {
   __atomic_store_n(&cb->seq, s + 1, __ATOMIC_RELAXED);
   __atomic_thread_fence(__ATOMIC_RELEASE);
   memcpy(g_area + sizeof *cb, p, n);
-  cb->payload_crc32c = procctl__crc32c(g_area + sizeof *cb, n);
+  cb->payload_crc = pc__crc32c(g_area + sizeof *cb, n);
   cb->payload_len = n;
-  cb->flags = 1;
   __atomic_store_n(&cb->seq, s + 2, __ATOMIC_RELEASE);
 }
 
@@ -47,7 +46,7 @@ int main(void) {
   snprintf(path, sizeof path, "/proc/self/fd/%d", c->fd);
   int fd = open(path, O_RDWR);
   uint8_t *m = mmap(NULL, c->map_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-  g_area = m + (c->area - c->map);
+  g_area = m + ((const struct procctl_header *)(const void *)c->map)->page_size;
 
   static uint8_t buf[8192];
   uint64_t gen;

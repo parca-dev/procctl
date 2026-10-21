@@ -21,6 +21,8 @@ spec:
       labels: {app: procctl-testclient}
     spec:
       terminationGracePeriodSeconds: 2
+      # GKE taints Arm nodes kubernetes.io/arch=arm64:NoSchedule.
+      tolerations: [{key: kubernetes.io/arch, operator: Exists, effect: NoSchedule}]
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
