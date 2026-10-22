@@ -2,7 +2,7 @@ CC     ?= cc
 BIN    := bin
 SAN    := -fsanitize=address,undefined -fno-sanitize-recover=all
 
-.PHONY: all test test-c test-go bench fuzz generate images e2e-kind clean
+.PHONY: all test test-c test-go bench fuzz generate images images-push e2e-kind clean
 
 all: $(BIN)/echo-client $(BIN)/echo-agent
 
@@ -49,6 +49,16 @@ generate:
 images:
 	docker build -f testclient/Dockerfile -t procctl-testclient:dev .
 	docker build -f cmd/procctl-testagent/Dockerfile -t procctl-testagent:dev .
+
+# Push the test images for another cluster's nodes:
+#   make images-push REGISTRY=ghcr.io/parca-dev [PLATFORM=linux/arm64]
+# (the default builder: it uses the host's network and DNS)
+TAG      ?= $(shell git rev-parse --short=12 HEAD)
+PLATFORM ?= linux/amd64
+images-push:
+	@test -n "$(REGISTRY)" || { echo "set REGISTRY"; exit 2; }
+	docker buildx build --builder default --platform $(PLATFORM) -f testclient/Dockerfile -t $(REGISTRY)/procctl-testclient:$(TAG) --push .
+	docker buildx build --builder default --platform $(PLATFORM) -f cmd/procctl-testagent/Dockerfile -t $(REGISTRY)/procctl-testagent:$(TAG) --push .
 
 # The e2e suite on a kind cluster named procctl-e2e (created if needed;
 # E2E_KEEP_CLUSTER=1 keeps it, E2E_KIND_IMAGE=kindest/node:vX picks the

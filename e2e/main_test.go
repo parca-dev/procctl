@@ -19,6 +19,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 
 	"sigs.k8s.io/e2e-framework/pkg/env"
@@ -58,6 +59,14 @@ func TestMain(m *testing.M) {
 	}
 	testenv.Setup(func(ctx context.Context, c *envconf.Config) (context.Context, error) {
 		kubeconfig = c.KubeconfigFile()
+		// Every scenario relies on its agent and its clients sharing a node.
+		out, err := kubectlErr("get", "nodes", "-o", "name")
+		if err != nil {
+			return ctx, fmt.Errorf("listing nodes: %v: %s", err, out)
+		}
+		if n := len(strings.Fields(out)); n != 1 {
+			return ctx, fmt.Errorf("the suite needs a one-node cluster; this one has %d nodes", n)
+		}
 		return ctx, nil
 	})
 	os.Exit(testenv.Run(m))
